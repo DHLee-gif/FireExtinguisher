@@ -13,6 +13,7 @@ from models import Admin, Device, FireEvent, StatusLog, WaterLog
 app = Flask(__name__)
 app.config["SECRET_KEY"] = config.SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_MB * 1024 * 1024
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.register_blueprint(rc_api)
 
 PUBLIC_ENDPOINTS = {"login", "static"}
