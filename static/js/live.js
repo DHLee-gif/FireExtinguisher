@@ -5,7 +5,7 @@
     const $ = (id) => document.getElementById(id);
     const pollMs = Number(root.dataset.pollMs) || 3000;
     const streamUrl = root.dataset.streamUrl;
-    let sortie = root.dataset.sortie === "1";
+    let sortie = false;
     let lastEventId = Number(root.dataset.lastEventId) || 0;
     let pollTimer = null;
     let streamRetry = null;
@@ -154,5 +154,4 @@
         });
     });
 
-    if (sortie) showLive(true);
 })();

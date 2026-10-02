@@ -133,7 +133,6 @@ def index():
         "index.html",
         stream_url=config.STREAM_URL,
         poll_ms=config.LIVE_POLL_MS,
-        sortie=state.snapshot()["sortie"],
         last_event_id=latest.event_id if latest else 0,
     )
 

@@ -5,16 +5,15 @@
 <div id="control"
      data-stream-url="{{ stream_url }}"
      data-poll-ms="{{ poll_ms }}"
-     data-sortie="{{ '1' if sortie else '0' }}"
      data-last-event-id="{{ last_event_id }}">
 
-    <section id="home-view" class="home" {% if sortie %}hidden{% endif %}>
+    <section id="home-view" class="home">
         <h1>안녕하세요, {{ session.admin_name }}님</h1>
         <p class="muted">출격 버튼을 누르면 RC카가 순찰을 시작합니다.</p>
         <button id="btn-sortie" class="btn sortie">출격</button>
     </section>
 
-    <section id="live-view" class="live" {% if not sortie %}hidden{% endif %}>
+    <section id="live-view" class="live" hidden>
         <div class="stream card">
             <img id="stream" alt="카메라 스트림">
             <div id="stream-off" class="stream-off" hidden>카메라 스트림에 연결할 수 없습니다.<br><small>{{ stream_url }}</small></div>
