@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %} AddDevice {% endblock %}
+{% block header %}
+{% include "header.html" %}
+{% endblock %}
+
+{% block content %}
+
+<main class="container">
+    <article>
+        <h2>장치 추가</h2>
+        <form method="post" action="/adddevice">
+
+            <label for="device_name">장치명</label>
+            <input type="text" id="device_name" name="device_name" placeholder="장치 이름을 입력하세요" required>
+
+            <label for="device_type">종류</label>
+            <input type="text" id="device_type" name="device_type" placeholder="장치 종류를 입력하세요" required>
+
+            <label for="status">상태</label>
+            <select id="status" name="status">
+                <option value="ON">ON</option>
+                <option value="OFF" selected>OFF</option>
+            </select>
+
+            <label for="ip_address">IP 주소</label>
+            <input type="text" id="ip_address" name="ip_address" placeholder="Enter IP address">
+
+            <label for="location">위치</label>
+            <input type="text" id="location" name="location" placeholder="Enter location">
+
+            <button type="submit">장치 추가</button>
+
+        </form>
+    </article>
+</main>
+
+{% endblock %}
+
+{% block footer %}
+{% include "footer.html" %}
+{% endblock %}

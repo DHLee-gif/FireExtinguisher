@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Login</title>
+
+    <link rel="stylesheet" href="https://c  dn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <main class="container login-container">
+        <article>
+            <h2>Login</h2>
+            <form method="post" action="/login">
+                <label for="user_id">ID</label>
+                <input type="text" name="user_id" placeholder="Enter your ID" required>
+
+                <label for="password">Password</label>
+                <input type="password" name="password" placeholder="Enter your Password" required>
+
+                <button type="submit">Login</button>
+                
+            </form>
+        </article>
+    </main>
+</body>
+</html>
