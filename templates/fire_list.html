@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Fire Event{% endblock %}
+
+{% block content %}
+<h1>Fire Event</h1>
+
+<section class="card">
+    <table class="list">
+        <thead>
+            <tr><th>#</th><th>감지 시각</th><th>온도(℃)</th><th>인식 신뢰도</th><th>상태</th><th>종료 시각</th></tr>
+        </thead>
+        <tbody>
+            {% for e in events %}
+            <tr class="clickable" onclick="location.href='{{ url_for('fire_detail', event_id=e.event_id) }}'">
+                <td><a href="{{ url_for('fire_detail', event_id=e.event_id) }}">{{ e.event_id }}</a></td>
+                <td>{{ e.detected_at | dt }}</td>
+                <td>{{ e.temperature | num }}</td>
+                <td>{{ (e.vision_score * 100) | num ~ '%' if e.vision_score is not none else '-' }}</td>
+                <td><span class="badge fire-{{ e.status }}">{{ FIRE_STATUS_LABELS[e.status] }}</span></td>
+                <td>{{ e.closed_at | dt }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty">기록이 없습니다.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

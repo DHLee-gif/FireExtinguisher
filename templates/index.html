@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}메인{% endblock %}
+
+{% block content %}
+<div id="control"
+     data-stream-url="{{ stream_url }}"
+     data-poll-ms="{{ poll_ms }}"
+     data-sortie="{{ '1' if sortie else '0' }}"
+     data-last-event-id="{{ last_event_id }}">
+
+    <section id="home-view" class="home" {% if sortie %}hidden{% endif %}>
+        <h1>안녕하세요, {{ session.admin_name }}님</h1>
+        <p class="muted">출격 버튼을 누르면 RC카가 순찰을 시작합니다.</p>
+        <button id="btn-sortie" class="btn sortie">출격</button>
+    </section>
+
+    <section id="live-view" class="live" {% if not sortie %}hidden{% endif %}>
+        <div class="stream card">
+            <img id="stream" alt="카메라 스트림">
+            <div id="stream-off" class="stream-off" hidden>카메라 스트림에 연결할 수 없습니다.<br><small>{{ stream_url }}</small></div>
+        </div>
+
+        <aside class="panel">
+            <div class="card info">
+                <div class="row"><span>연결</span><strong id="v-online">-</strong></div>
+                <div class="row"><span>현재 동작</span><strong id="v-action">-</strong></div>
+                <div class="row"><span>현재 상태</span><span id="v-level" class="badge">-</span></div>
+                <div class="row"><span>물 잔량</span><strong id="v-water">-</strong></div>
+                <div class="meter"><div id="v-water-bar" class="meter-fill"></div></div>
+                <p id="v-errors" class="alert error small" hidden></p>
+                <p id="v-lastlog" class="muted small"></p>
+            </div>
+
+            <div class="card info">
+                <div class="row"><span>최근 화재</span><a id="v-event" href="{{ url_for('fire_list') }}">-</a></div>
+            </div>
+
+            <div class="controls">
+                <button class="btn danger" data-cmd="stop">긴급 정지</button>
+                <button class="btn" data-cmd="return">복귀</button>
+                <button class="btn ok" data-cmd="resume">재개</button>
+            </div>
+            <p id="db-error" class="alert warning small" hidden>DB에 연결할 수 없습니다. 연결 상태·로그·화재 정보가 표시되지 않습니다.</p>
+            <p id="poll-error" class="alert warning small" hidden>서버 응답이 없습니다. 재시도 중…</p>
+        </aside>
+    </section>
+</div>
+
+<div id="fire-modal" class="modal" hidden>
+    <div class="modal-box">
+        <h2>화재 감지!</h2>
+        <p id="fire-modal-text"></p>
+        <div class="modal-actions">
+            <a id="fire-modal-link" class="btn primary" href="#">상세 보기</a>
+            <button id="fire-modal-close" class="btn">닫기</button>
+        </div>
+    </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+{% endblock %}
+
+{% block script %}
+<script src="{{ url_for('static', filename='js/live.js') }}"></script>
+{% endblock %}

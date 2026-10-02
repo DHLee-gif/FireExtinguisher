@@ -1,11 +1,13 @@
-import pymysql
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-def get_db_connection():
-    return pymysql.connect(
-        host='127.0.0.1',
-        port=13306,
-        user='ktech',
-        password='ktech1234',
-        database='myfarm',
-        cursorclass=pymysql.cursors.DictCursor        
-    )
+import config
+
+engine = create_engine(
+    config.SQLALCHEMY_URL,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    connect_args={"connect_timeout": 3},
+)
+
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

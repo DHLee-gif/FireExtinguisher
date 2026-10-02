@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Water Log{% endblock %}
+
+{% block content %}
+<h1>Water Log</h1>
+
+<section class="card water-now">
+    <span class="muted">현재 물 잔량</span>
+    {% if current and current.water_level is not none %}
+    <strong class="big">{{ current.water_level | num }}%</strong>
+    <div class="meter"><div class="meter-fill {{ 'low' if current.water_level < 30 }}"
+         style="width: {{ [[current.water_level, 0] | max, 100] | min }}%"></div></div>
+    <span class="muted small">{{ current.logged_at | dt }} 기준</span>
+    {% else %}
+    <strong class="big">-</strong>
+    {% endif %}
+</section>
+
+<section class="card">
+    <table class="list">
+        <thead><tr><th>시각</th><th>수위(%)</th><th>동작</th></tr></thead>
+        <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log.logged_at | dt }}</td>
+                <td>{{ log.water_level | num }}</td>
+                <td>{% if log.action %}<span class="badge water-{{ log.action }}">{{ WATER_ACTION_LABELS[log.action] }}</span>{% else %}-{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty">기록이 없습니다.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

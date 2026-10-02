@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Status Log{% endblock %}
+
+{% block content %}
+<h1>Status Log</h1>
+
+<form method="get" class="filters card">
+    <label>레벨
+        <select name="level" {% if unresolved %}disabled{% endif %}>
+            <option value="">전체</option>
+            {% for key, label in LEVEL_LABELS.items() %}
+            <option value="{{ key }}" {% if level == key %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label class="check">
+        <input type="checkbox" name="unresolved" value="1" {% if unresolved %}checked{% endif %}
+               onchange="this.form.level.disabled = this.checked">
+        미해결 에러만 보기
+    </label>
+    <button type="submit" class="btn">적용</button>
+    <a href="{{ url_for('status_log') }}" class="btn">초기화</a>
+</form>
+
+<section class="card">
+    <table class="list">
+        <thead><tr><th>시각</th><th>레벨</th><th>코드</th><th>메시지</th><th>해결 시각</th></tr></thead>
+        <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log.logged_at | dt }}</td>
+                <td><span class="badge {{ log.level }}">{{ LEVEL_LABELS[log.level] }}</span></td>
+                <td><code>{{ log.code or '-' }}</code></td>
+                <td>{{ log.message or '-' }}</td>
+                <td>
+                    {% if log.resolved_at %}{{ log.resolved_at | dt }}
+                    {% elif log.level == 'error' %}<span class="text-error">미해결</span>
+                    {% else %}-{% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">기록이 없습니다.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

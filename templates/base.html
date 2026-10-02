@@ -1,16 +1,30 @@
 <!DOCTYPE html>
-<html data-theme="light">
-    <head>
-        <title>{% block title %}Base{% endblock %}</title>
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-        <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    </head>
-    <body>
-        {% block header %}{% endblock %}
-        {% block content %}{% endblock %}
-        {% block footer %}
-        {% include "footer.html" %}{% endblock %}
-        {% block script %}{% endblock %}
-    </body>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}관제{% endblock %} · FireCar</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    {% if session.admin_id is not none %}
+    <header class="topbar">
+        <a class="brand" href="{{ url_for('index') }}">FireCar 관제</a>
+        <nav>
+            {% set ep = request.endpoint %}
+            <a href="{{ url_for('admin_info') }}" class="{{ 'active' if ep == 'admin_info' }}">관리자 정보</a>
+            <a href="{{ url_for('fire_list') }}" class="{{ 'active' if ep in ('fire_list', 'fire_detail') }}">Fire Event</a>
+            <a href="{{ url_for('status_log') }}" class="{{ 'active' if ep == 'status_log' }}">Status Log</a>
+            <a href="{{ url_for('water_log') }}" class="{{ 'active' if ep == 'water_log' }}">Water Log</a>
+            <a href="{{ url_for('logout') }}" class="logout">로그아웃</a>
+        </nav>
+    </header>
+    {% endif %}
 
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    {% block script %}{% endblock %}
+</body>
 </html>

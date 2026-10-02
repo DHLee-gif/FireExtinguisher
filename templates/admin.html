@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}관리자 정보{% endblock %}
+
+{% block content %}
+<h1>관리자 정보</h1>
+
+<div class="grid-2">
+    <section class="card">
+        <h2>관리자</h2>
+        <table class="kv">
+            <tr><th>이름</th><td>{{ admin.name }}</td></tr>
+            <tr><th>아이디</th><td>{{ admin.login_id }}</td></tr>
+        </table>
+    </section>
+
+    <section class="card">
+        <h2>RC카</h2>
+        {% if device %}
+        <table class="kv">
+            <tr><th>이름</th><td>{{ device.name }}</td></tr>
+            <tr>
+                <th>연결 상태</th>
+                <td>
+                    {% if online %}<span class="badge normal">온라인</span>
+                    {% else %}<span class="badge offline">오프라인</span>{% endif %}
+                </td>
+            </tr>
+            <tr><th>마지막 통신</th><td>{{ device.last_seen | dt }}</td></tr>
+        </table>
+        {% elif not db_ok %}
+        <p class="muted">DB에 연결할 수 없어 RC카 정보를 불러오지 못했습니다.</p>
+        {% else %}
+        <p class="muted">등록된 RC카가 없습니다. seed.py 를 실행하세요.</p>
+        {% endif %}
+    </section>
+</div>
+{% endblock %}

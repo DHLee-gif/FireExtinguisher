@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Fire Event #{{ event.event_id }}{% endblock %}
+
+{% block content %}
+<p><a href="{{ url_for('fire_list') }}">&larr; 목록으로</a></p>
+<h1>Fire Event #{{ event.event_id }}
+    <span class="badge fire-{{ event.status }}">{{ FIRE_STATUS_LABELS[event.status] }}</span>
+</h1>
+
+<section class="card">
+    <table class="kv">
+        <tr><th>감지 시각</th><td>{{ event.detected_at | dt }}</td></tr>
+        <tr><th>온도</th><td>{{ event.temperature | num }} ℃</td></tr>
+        <tr><th>인식 신뢰도</th><td>{{ (event.vision_score * 100) | num ~ '%' if event.vision_score is not none else '-' }}</td></tr>
+        <tr><th>종료 시각</th><td>{{ event.closed_at | dt }}</td></tr>
+    </table>
+</section>
+
+<div class="grid-2">
+    {% for title, images in [('진화 전', before), ('진화 후', after)] %}
+    <section class="card">
+        <h2>{{ title }}</h2>
+        {% for img in images %}
+        <figure class="photo">
+            <a href="{{ url_for('static', filename=img.file_path) }}" target="_blank">
+                <img src="{{ url_for('static', filename=img.file_path) }}" alt="{{ title }} 사진">
+            </a>
+            <figcaption>{{ img.taken_at | dt }}</figcaption>
+        </figure>
+        {% else %}
+        <p class="muted">사진이 없습니다.</p>
+        {% endfor %}
+    </section>
+    {% endfor %}
+</div>
+
+<section class="card">
+    <h2>분사 기록</h2>
+    <table class="list">
+        <thead><tr><th>회차</th><th>분사 시작</th><th>분사 시간</th><th>분사 후 온도(℃)</th></tr></thead>
+        <tbody>
+            {% for s in sprays %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td>{{ s.started_at | dt }}</td>
+                <td>{{ (s.duration_ms / 1000) | num ~ ' 초' if s.duration_ms is not none else '-' }}</td>
+                <td>{{ s.temp_after | num }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">분사 기록이 없습니다.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

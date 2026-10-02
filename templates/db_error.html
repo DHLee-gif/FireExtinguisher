@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}DB 연결 실패{% endblock %}
+
+{% block content %}
+<section class="card">
+    <h1>DB에 연결할 수 없습니다</h1>
+    <p class="muted">MariaDB 서버({{ config_db }})가 켜져 있는지, firecar DB가 생성되었는지 확인하세요.</p>
+    <p><a href="{{ request.path }}" class="btn">다시 시도</a></p>
+</section>
+{% endblock %}
