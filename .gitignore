@@ -1,4 +1,4 @@
 .venv/
 __pycache__/
 *.pyc
-static/uploads/
+web/static/uploads/
