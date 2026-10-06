@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import getpass
 import os
 import re
@@ -30,7 +31,7 @@ def run_schema():
     print(f"[schema] {len(statements)}개 SQL 실행 완료 (DB: {config.DB_NAME})")
 
 
-def seed(login_id, name, password):
+def seed(login_id, name, password, expires_at=None):
     from db import SessionLocal
     from models import Admin, Device
 
@@ -39,8 +40,9 @@ def seed(login_id, name, password):
         if admin:
             print(f"[seed] 관리자 '{login_id}' 이미 존재 - 건너뜀")
         else:
-            db.add(Admin(login_id=login_id, name=name, password_hash=generate_password_hash(password)))
-            print(f"[seed] 관리자 '{login_id}' ({name}) 생성")
+            db.add(Admin(login_id=login_id, name=name, password_hash=generate_password_hash(password),
+                         expires_at=expires_at))
+            print(f"[seed] 관리자 '{login_id}' ({name}) 생성, 사용 기한: {expires_at or '무기한'}")
 
         if db.get(Device, config.DEVICE_ID):
             print(f"[seed] device {config.DEVICE_ID} 이미 존재 - 건너뜀")
@@ -57,6 +59,7 @@ if __name__ == "__main__":
     parser.add_argument("--login-id", default="admin")
     parser.add_argument("--name", default="관리자")
     parser.add_argument("--password", help="생략하면 입력 프롬프트가 뜸")
+    parser.add_argument("--expires", type=datetime.date.fromisoformat, help="사용 기한 (예: 2026-12-31), 생략하면 무기한")
     args = parser.parse_args()
 
     if args.schema:
@@ -65,4 +68,5 @@ if __name__ == "__main__":
     password = args.password or getpass.getpass(f"'{args.login_id}' 비밀번호: ")
     if not password:
         parser.error("비밀번호가 비어 있습니다.")
-    seed(args.login_id, args.name, password)
+    expires_at = datetime.datetime.combine(args.expires, datetime.time(23, 59, 59)) if args.expires else None
+    seed(args.login_id, args.name, password, expires_at)

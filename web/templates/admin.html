@@ -10,6 +10,7 @@
         <table class="kv">
             <tr><th>이름</th><td>{{ admin.name }}</td></tr>
             <tr><th>아이디</th><td>{{ admin.login_id }}</td></tr>
+            <tr><th>사용 기한</th><td>{{ admin.expires_at | dt if admin.expires_at else '무기한' }}</td></tr>
         </table>
     </section>
 
@@ -25,6 +26,7 @@
                     {% else %}<span class="badge offline">오프라인</span>{% endif %}
                 </td>
             </tr>
+            <tr><th>배터리</th><td>{{ device.battery_level | num ~ '%' if device.battery_level is not none else '-' }}</td></tr>
             <tr><th>마지막 통신</th><td>{{ device.last_seen | dt }}</td></tr>
         </table>
         {% elif not db_ok %}

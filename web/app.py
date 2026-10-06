@@ -8,7 +8,7 @@ import labels
 import state
 from api import bp as rc_api
 from db import SessionLocal
-from models import Admin, Device, FireEvent, StatusLog, WaterLog
+from models import Admin, Device, DeviceStatusLog, FireLog, WaterLog
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = config.SECRET_KEY
@@ -76,14 +76,14 @@ def get_latest_water(db):
 
 def get_unresolved_errors(db):
     return db.scalars(
-        select(StatusLog)
-        .where(StatusLog.level == "error", StatusLog.resolved_at.is_(None))
-        .order_by(StatusLog.log_id)
+        select(DeviceStatusLog)
+        .where(DeviceStatusLog.level == "error", DeviceStatusLog.resolved_at.is_(None))
+        .order_by(DeviceStatusLog.log_id)
     ).all()
 
 
 def get_latest_event(db):
-    return db.scalars(select(FireEvent).order_by(FireEvent.event_id.desc()).limit(1)).first()
+    return db.scalars(select(FireLog).order_by(FireLog.event_id.desc()).limit(1)).first()
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -106,13 +106,17 @@ def login():
 
         with SessionLocal() as db:
             admin = db.scalar(select(Admin).where(Admin.login_id == login_id))
-        if admin and check_password_hash(admin.password_hash, password):
+            now = db.scalar(select(func.now()))
+        if admin is None or not check_password_hash(admin.password_hash, password):
+            error = "아이디 또는 비밀번호가 올바르지 않습니다."
+        elif admin.expires_at is not None and admin.expires_at < now:
+            error = "사용 기간이 만료된 계정입니다."
+        else:
             session.clear()
             session["admin_id"] = admin.admin_id
             session["admin_login_id"] = admin.login_id
             session["admin_name"] = admin.name
             return redirect(url_for("index"))
-        error = "아이디 또는 비밀번호가 올바르지 않습니다."
 
     return render_template("login.html", error=error, login_id=login_id, bypass=config.LOGIN_BYPASS)
 
@@ -159,7 +163,7 @@ def admin_info():
 def fire_list():
     with SessionLocal() as db:
         events = db.scalars(
-            select(FireEvent).order_by(FireEvent.detected_at.desc(), FireEvent.event_id.desc())
+            select(FireLog).order_by(FireLog.detected_at.desc(), FireLog.event_id.desc())
             .limit(config.LIST_LIMIT)
         ).all()
     return render_template("fire_list.html", events=events)
@@ -168,7 +172,7 @@ def fire_list():
 @app.route("/fire/<int:event_id>")
 def fire_detail(event_id):
     with SessionLocal() as db:
-        event = db.get(FireEvent, event_id)
+        event = db.get(FireLog, event_id)
         if event is None:
             abort(404)
         before = [img for img in event.images if img.img_type == "before"]
@@ -182,14 +186,14 @@ def status_log():
     level = request.args.get("level", "")
     unresolved = request.args.get("unresolved") == "1"
 
-    stmt = select(StatusLog)
+    stmt = select(DeviceStatusLog)
     if unresolved:
-        stmt = stmt.where(StatusLog.level == "error", StatusLog.resolved_at.is_(None))
+        stmt = stmt.where(DeviceStatusLog.level == "error", DeviceStatusLog.resolved_at.is_(None))
     elif level in labels.LEVEL_LABELS:
-        stmt = stmt.where(StatusLog.level == level)
+        stmt = stmt.where(DeviceStatusLog.level == level)
 
     with SessionLocal() as db:
-        logs = db.scalars(stmt.order_by(StatusLog.log_id.desc()).limit(config.LIST_LIMIT)).all()
+        logs = db.scalars(stmt.order_by(DeviceStatusLog.log_id.desc()).limit(config.LIST_LIMIT)).all()
     return render_template("status.html", logs=logs, level=level, unresolved=unresolved)
 
 
@@ -208,7 +212,7 @@ def api_live():
         with SessionLocal() as db:
             device, online, elapsed = get_device_status(db)
             errors = get_unresolved_errors(db)
-            latest_log = db.scalars(select(StatusLog).order_by(StatusLog.log_id.desc()).limit(1)).first()
+            latest_log = db.scalars(select(DeviceStatusLog).order_by(DeviceStatusLog.log_id.desc()).limit(1)).first()
             latest_event = get_latest_event(db)
             latest_water = get_latest_water(db)
     except OperationalError:
@@ -232,6 +236,7 @@ def api_live():
         online=online,
         last_seen=format_datetime(device.last_seen) if device else "-",
         last_seen_sec=elapsed,
+        battery_level=device.battery_level if device else None,
         action=live["action"],
         action_label=labels.ACTION_LABELS.get(live["action"], live["action"]),
         level=level,
@@ -273,9 +278,10 @@ def api_control(cmd):
                 codes = ", ".join(e.code or f"#{e.log_id}" for e in errors)
                 for e in errors:
                     e.resolved_at = func.now()
-                db.add(StatusLog(level="normal", code="MANUAL_RESOLVED",
-                                 message=f"관리자 수동 해제: {codes}"[:100]))
-                db.add(StatusLog(level="normal", code="PATROL_RESUME", message="관리자 명령으로 순찰 재개"))
+                db.add(DeviceStatusLog(device_id=config.DEVICE_ID, level="normal", code="MANUAL_RESOLVED",
+                                       message=f"관리자 수동 해제: {codes}"[:100]))
+                db.add(DeviceStatusLog(device_id=config.DEVICE_ID, level="normal", code="PATROL_RESUME",
+                                       message="관리자 명령으로 순찰 재개"))
                 db.commit()
                 message = f"에러({codes})를 해제하고 재개 명령을 보냈습니다."
 

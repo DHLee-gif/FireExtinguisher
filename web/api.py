@@ -9,7 +9,7 @@ import config
 import state
 from db import SessionLocal
 from labels import ACTION_LABELS
-from models import Device, FireEvent, FireImage, SprayLog, StatusLog, WaterLog
+from models import Device, DeviceStatusLog, FireImage, FireLog, SprayLog, WaterLog
 
 bp = Blueprint("rc_api", __name__, url_prefix="/api")
 
@@ -41,6 +41,11 @@ def error(message, code=400):
     return jsonify(ok=False, error=message), code
 
 
+def find_device(db, data):
+    device_id = to_int(data.get("device_id")) or config.DEVICE_ID
+    return db.get(Device, device_id)
+
+
 def check_image(file):
     if file is None or not file.filename:
         return None, "image 파일이 필요합니다."
@@ -65,14 +70,17 @@ def heartbeat():
     if action and action not in ACTION_LABELS:
         return error(f"알 수 없는 action: {action}")
     water_level = to_float(data.get("water_level"))
+    battery_level = to_float(data.get("battery_level"))
 
     state.update_from_heartbeat(action, water_level)
 
     with SessionLocal() as db:
-        device = db.get(Device, config.DEVICE_ID)
+        device = find_device(db, data)
         if device is None:
-            return error("device 행이 없습니다. seed.py 를 먼저 실행하세요.", 500)
+            return error("등록되지 않은 device 입니다. seed.py 를 먼저 실행하세요.", 404)
         device.last_seen = func.now()
+        if battery_level is not None:
+            device.battery_level = battery_level
         db.commit()
 
     return jsonify(ok=True)
@@ -92,7 +100,11 @@ def create_fire():
         return error(err)
 
     with SessionLocal() as db:
-        event = FireEvent(
+        device = find_device(db, data)
+        if device is None:
+            return error("등록되지 않은 device 입니다.", 404)
+        event = FireLog(
+            device_id=device.device_id,
             temperature=to_float(data.get("temperature")),
             vision_score=to_float(data.get("vision_score")),
         )
@@ -108,9 +120,9 @@ def create_fire():
 def add_spray(event_id):
     data = payload()
     with SessionLocal() as db:
-        event = db.get(FireEvent, event_id)
+        event = db.get(FireLog, event_id)
         if event is None:
-            return error("fire_event 가 없습니다.", 404)
+            return error("fire_log 가 없습니다.", 404)
         spray = SprayLog(
             event_id=event_id,
             duration_ms=to_int(data.get("duration_ms")),
@@ -131,8 +143,8 @@ def add_after_image(event_id):
         return error(err)
 
     with SessionLocal() as db:
-        if db.get(FireEvent, event_id) is None:
-            return error("fire_event 가 없습니다.", 404)
+        if db.get(FireLog, event_id) is None:
+            return error("fire_log 가 없습니다.", 404)
         path = save_image(file, ext, event_id, "after")
         image = FireImage(event_id=event_id, img_type="after", file_path=path)
         db.add(image)
@@ -155,9 +167,9 @@ def update_fire(event_id):
             return error("closed_at 은 ISO 형식(YYYY-MM-DD HH:MM:SS)이어야 합니다.")
 
     with SessionLocal() as db:
-        event = db.get(FireEvent, event_id)
+        event = db.get(FireLog, event_id)
         if event is None:
-            return error("fire_event 가 없습니다.", 404)
+            return error("fire_log 가 없습니다.", 404)
         event.status = status
         if closed_at:
             event.closed_at = closed_at
@@ -175,7 +187,11 @@ def add_status():
         return error(f"level 은 {LEVELS} 중 하나여야 합니다.")
 
     with SessionLocal() as db:
-        log = StatusLog(
+        device = find_device(db, data)
+        if device is None:
+            return error("등록되지 않은 device 입니다.", 404)
+        log = DeviceStatusLog(
+            device_id=device.device_id,
             level=level,
             code=(data.get("code") or None) and data["code"][:30],
             message=(data.get("message") or None) and data["message"][:100],
@@ -194,7 +210,10 @@ def add_water():
     water_level = to_float(data.get("water_level"))
 
     with SessionLocal() as db:
-        log = WaterLog(water_level=water_level, action=action)
+        device = find_device(db, data)
+        if device is None:
+            return error("등록되지 않은 device 입니다.", 404)
+        log = WaterLog(device_id=device.device_id, water_level=water_level, action=action)
         db.add(log)
         db.commit()
 

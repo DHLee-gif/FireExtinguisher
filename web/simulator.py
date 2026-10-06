@@ -58,6 +58,7 @@ class FireCar:
         self.step_sec = step_sec
         self.action = "idle"
         self.water = 100.0
+        self.battery = 100.0
         self.http = requests.Session()
         self._hb_http = requests.Session()
         self._stop = threading.Event()
@@ -69,8 +70,11 @@ class FireCar:
         return res.json()
 
     def send_heartbeat(self, http=None):
+        if self.action != "idle":
+            self.battery = max(0.0, self.battery - 0.2)
         (http or self.http).post(self.server + "/api/heartbeat",
-                                 json={"action": self.action, "water_level": round(self.water, 1)}, timeout=5)
+                                 json={"action": self.action, "water_level": round(self.water, 1),
+                                       "battery_level": round(self.battery, 1)}, timeout=5)
 
     def _heartbeat_loop(self):
         while not self._stop.wait(self.heartbeat_sec):

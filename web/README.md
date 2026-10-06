@@ -54,6 +54,12 @@ python seed.py --login-id admin --name 관리자
 
 이미 등록된 계정이나 RC카는 건너뛰기 때문에 여러 번 실행해도 문제없습니다.
 
+관리자 계정에 사용 기한을 두고 싶으면 --expires 옵션을 붙입니다. 기한이 지난 계정은 로그인이 막힙니다.
+
+```powershell
+python seed.py --login-id guest --name 임시관리자 --expires 2026-12-31
+```
+
 ## 서버 실행
 
 ```powershell
@@ -101,7 +107,7 @@ Fire Event 상세 페이지에서는 진화 전후 사진과 분사 기록을 �
 RC카는 아래 API로 서버와 통신합니다. 로그인 없이 JSON으로 주고받습니다.
 
 ```
-POST /api/heartbeat           현재 동작과 물 잔량 전송, 마지막 통신 시각 갱신
+POST /api/heartbeat           현재 동작, 물 잔량, 배터리 전송, 마지막 통신 시각 갱신
 GET  /api/command             대기 중인 명령 받아가기 (start, stop, return, resume)
 POST /api/fire                진화 전 사진과 온도, 인식 신뢰도로 화재 등록
 POST /api/fire/<id>/spray     분사 기록 추가
@@ -114,10 +120,12 @@ POST /api/water               수위 로그 기록
 heartbeat 예시입니다.
 
 ```json
-{"action": "patrol", "water_level": 72.5}
+{"device_id": 1, "action": "patrol", "water_level": 72.5, "battery_level": 88}
 ```
 
 action에는 idle, patrol, extinguish, homing, refill, stopped 중 하나를 보내면 됩니다.
+device_id는 모든 API에 함께 보낼 수 있고, 생략하면 1번(FireCar-01)으로 기록됩니다.
+지금은 RC카가 1대지만 나중에 늘어날 것을 생각해서 로그 테이블마다 device_id를 넣어 두었습니다.
 인식 신뢰도는 0에서 1 사이 값으로 보내면 화면에는 퍼센트로 표시됩니다.
 사진은 static/uploads 폴더에 저장되고, DB에는 파일 경로만 저장됩니다.
 

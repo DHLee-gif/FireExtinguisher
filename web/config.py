@@ -2,7 +2,7 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DB_HOST = os.environ.get("FIRECAR_DB_HOST", "172.30.1.65")
+DB_HOST = os.environ.get("FIRECAR_DB_HOST", "172.30.1.85")
 DB_PORT = int(os.environ.get("FIRECAR_DB_PORT", "3306"))
 DB_USER = os.environ.get("FIRECAR_DB_USER", "ktech")
 DB_PASSWORD = os.environ.get("FIRECAR_DB_PASSWORD", "ktech1234")

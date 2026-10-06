@@ -88,6 +88,9 @@
             $("v-water-bar").classList.toggle("low", w < 30);
         }
 
+        $("v-battery").textContent =
+            d.battery_level === null || d.battery_level === undefined ? "-" : d.battery_level.toFixed(0) + "%";
+
         const errors = $("v-errors");
         if (d.unresolved_errors.length) {
             errors.hidden = false;
