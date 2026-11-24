@@ -1,0 +1,660 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <stdlib.h>   /* atoi */
+#include <ctype.h>    /* toupper */
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* PWM 최대값: CubeMX TIM1 Period(ARR)와 같은 값이어야 함 */
+#define PWM_MAX        1599
+
+/* 실제로 허용하는 PWM 최대값
+ * 18650 3개 직렬(완충 12.6V)로 6V 모터를 돌리므로 6 / 12.6 ≈ 48% → 1599 × 0.48 ≈ 760
+ * (AA 4개 6V로 돌릴 때는 PWM_MAX로 바꿔도 됨) */
+#define PWM_LIMIT      760
+
+/* ---- 하드웨어 채널 ↔ 차의 실제 좌우 연결 ----
+ * 채널 A = PWMA·AIN1·AIN2(AO1/AO2) + TIM2 엔코더 → L1·L2 라벨 모터
+ * 채널 B = PWMB·BIN1·BIN2(BO1/BO2) + TIM3 엔코더 → R1·R2 라벨 모터
+ * 차를 뒤집어 조립하면서 실제 위치가 바뀜 (앞 = TB6612 쪽 기준):
+ *   L1·L2 모터(채널 A)가 오른쪽, R1·R2 모터(채널 B)가 왼쪽 */
+#define SWAP_LR        1      /* 1: 채널 A를 오른쪽, 채널 B를 왼쪽으로 사용 */
+
+/* 채널에 + 명령을 줬을 때 차를 앞으로 밀면 1, 뒤로 밀면 -1 */
+#define MOTOR_A_DIR    (1)    /* F 20에서 채널 A(오른쪽)는 앞으로 돌았음 */
+#define MOTOR_B_DIR    (-1)   /* F 20에서 채널 B(왼쪽)는 뒤로 돌았음 → 뒤집기 */
+
+/* 채널에 + 명령을 줬을 때 엔코더 카운트가 늘면 1, 줄면 -1 (모터 자체 기준, 위와 별개)
+ * 지금까지 테스트에서 두 채널 모두 +명령 → 카운트 증가였음 */
+#define ENC_A_DIR      (1)
+#define ENC_B_DIR      (1)
+
+/* ---- 속도 PI 제어 (TIM6 10ms마다 실행) ----
+ * 속도 단위: 10ms 동안 늘어난 엔코더 카운트 (cnt/10ms)
+ * 참고: 바퀴 띄우고 60%(PWM 960)일 때 약 37 cnt/10ms 나왔음 → 1 cnt/10ms ≈ PWM 26
+ * KF: 목표 속도에 맞는 PWM을 미리 대충 넣어주는 값 (피드포워드)
+ * KP: 지금 오차만큼 바로 보정
+ * KI: 오차가 계속 남아 있으면 조금씩 쌓아서 보정 (뻑뻑한 쪽을 끝까지 따라잡게 함) */
+#define KF             12.0f   /* 6V 때 22 → 전압 2배라 절반 정도로 */
+#define KP             8.0f    /* 6V 때 15 */
+#define KI             1.0f    /* 6V 때 2 */
+
+/* ---- 명령 인터페이스 ----
+ * 명령에 숫자를 안 붙이면 쓰는 기본 속도, 그리고 허용 최대 속도 [cnt/10ms]
+ * (바퀴 띄우고 PWM 100%여도 대략 60 정도라 여유 있게 40으로 제한) */
+#define CMD_DEFAULT_SPEED  20
+#define CMD_MAX_SPEED      40
+#define CMD_LINE_MAX       32     /* 명령 한 줄 최대 글자 수 */
+#define RX_RING_SIZE       64     /* 수신 링버퍼 크기 (2의 거듭제곱) */
+
+/* 안전장치: 마지막 명령 후 이 시간(ms) 동안 새 명령이 없으면 자동 정지
+ * 지금은 손으로 명령 보내는 테스트라 2초, 라즈베리파이가 계속 보내게 되면 500 정도로 줄이기 */
+#define CMD_TIMEOUT_MS     2000
+
+/* HC-05 통신 속도: 평소(데이터 모드) 9600, AT 설정 모드는 38400으로 고정 */
+#define BT_BAUD_DATA       9600
+#define BT_BAUD_AT         38400
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+/* 엔코더 누적 카운트 (전원 켠 뒤부터 계속 더해짐)
+ * 이제 TIM6 인터럽트에서만 갱신하므로 volatile */
+static volatile int32_t enc_left_total  = 0;
+static volatile int32_t enc_right_total = 0;
+/* 직전에 읽은 타이머 카운터 값 (16비트) */
+static uint16_t enc_left_prev  = 0;
+static uint16_t enc_right_prev = 0;
+
+/* PI 제어 변수 (인터럽트와 main이 같이 보므로 volatile) */
+static volatile int target_l = 0, target_r = 0;   /* 목표 속도 [cnt/10ms] */
+static volatile int speed_l  = 0, speed_r  = 0;   /* 측정 속도 [cnt/10ms] */
+static volatile int pwm_l    = 0, pwm_r    = 0;   /* 출력 PWM (-1599 ~ 1599) */
+static float integ_l = 0.0f, integ_r = 0.0f;      /* 오차 누적값 (I항) */
+
+/* 명령을 받는 통로 하나(UART 하나)에 필요한 것들을 묶은 구조체
+ * PC(USART2, USB)와 블루투스(USART1, HC-05) 두 개를 똑같은 코드로 처리하기 위해 */
+typedef struct {
+  UART_HandleTypeDef *huart;               /* 어느 UART인지 */
+  uint8_t interactive;                     /* 1: 에코·프롬프트 출력(PC 터미널), 0: 안 함(폰 앱은 자기가 보여줌) */
+  uint8_t rx_byte;                         /* HAL이 1글자 받아 넣는 자리 */
+  volatile uint8_t ring[RX_RING_SIZE];     /* 받은 글자 저장소 (원형) */
+  volatile uint16_t head;                  /* 인터럽트가 쓰는 위치 */
+  uint16_t tail;                           /* 메인 루프가 읽는 위치 */
+  char line[CMD_LINE_MAX];                 /* 조립 중인 명령 한 줄 */
+  uint8_t len;
+} cmd_port_t;
+
+static cmd_port_t port_pc = { .huart = &huart2, .interactive = 1 };
+static cmd_port_t port_bt = { .huart = &huart1, .interactive = 0 };
+
+/* printf가 출력할 UART: 명령이 들어온 쪽으로 답하기 위해 잠깐씩 바꿔 씀 */
+static UART_HandleTypeDef *out_uart = &huart2;
+
+/* 타임아웃 안전장치용: 마지막으로 명령을 받은 시각과 통로 */
+static uint32_t last_cmd_tick = 0;
+static UART_HandleTypeDef *last_cmd_uart = &huart2;
+
+/* AT 중계 모드: 1이면 PC 터미널 ↔ HC-05를 그대로 이어줌 (HC-05 설정 확인·변경용) */
+static uint8_t at_bridge = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+void drive(int left, int right);
+void drive_pwm(int left_pwm, int right_pwm);
+void motor_stop(void);
+void encoder_update(void);
+void set_speed(int left, int right);
+static void process_command(char *line);
+static void at_bridge_enter(void);
+static void print_status(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/* printf 출력을 out_uart로 보냄
+ * 기본은 USART2(PC 터미널, 115200bps), 블루투스 명령에 답할 때는 USART1(HC-05, 9600bps) */
+int _write(int file, char *ptr, int len)
+{
+  (void)file;
+  HAL_UART_Transmit(out_uart, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+  return len;
+}
+
+/* 모터 한 쌍 제어: pwm = -PWM_MAX ~ +PWM_MAX
+ * 양수면 IN1=HIGH, IN2=LOW (정방향), 음수면 반대 (역방향)
+ * 크기(절댓값)가 PWM 듀티 → 속도 */
+static void motor_set(uint32_t channel,
+                      GPIO_TypeDef *in1_port, uint16_t in1_pin,
+                      GPIO_TypeDef *in2_port, uint16_t in2_pin,
+                      int pwm)
+{
+  if (pwm >  PWM_LIMIT) pwm =  PWM_LIMIT;   /* 모터 정격(6V) 보호 */
+  if (pwm < -PWM_LIMIT) pwm = -PWM_LIMIT;
+
+  if (pwm >= 0) {
+    HAL_GPIO_WritePin(in1_port, in1_pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(in2_port, in2_pin, GPIO_PIN_RESET);
+  } else {
+    HAL_GPIO_WritePin(in1_port, in1_pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(in2_port, in2_pin, GPIO_PIN_SET);
+    pwm = -pwm;
+  }
+  __HAL_TIM_SET_COMPARE(&htim1, channel, (uint32_t)pwm);
+}
+
+/* PWM 값으로 직접 구동 (PI 제어가 사용)
+ * left/right는 "차의 실제 왼쪽/오른쪽", +는 "차를 앞으로" 기준
+ * → SWAP_LR, MOTOR_x_DIR로 하드웨어 채널과 방향에 맞게 바꿔서 출력 */
+void drive_pwm(int left_pwm, int right_pwm)
+{
+  int a = SWAP_LR ? right_pwm : left_pwm;   /* 채널 A에 줄 값 */
+  int b = SWAP_LR ? left_pwm  : right_pwm;  /* 채널 B에 줄 값 */
+  motor_set(TIM_CHANNEL_1, AIN1_GPIO_Port, AIN1_Pin, AIN2_GPIO_Port, AIN2_Pin, MOTOR_A_DIR * a);  /* L1 + L2 라벨 모터 */
+  motor_set(TIM_CHANNEL_2, BIN1_GPIO_Port, BIN1_Pin, BIN2_GPIO_Port, BIN2_Pin, MOTOR_B_DIR * b);  /* R1 + R2 라벨 모터 */
+}
+
+/* 퍼센트로 구동: drive(60, 60) 전진, drive(-60, -60) 후진 (PI 없이 직접 돌릴 때) */
+void drive(int left, int right)
+{
+  drive_pwm(PWM_MAX * left / 100, PWM_MAX * right / 100);
+}
+
+/* 정지: PWM 0, 방향 핀 모두 LOW */
+void motor_stop(void)
+{
+  drive_pwm(0, 0);
+  HAL_GPIO_WritePin(AIN1_GPIO_Port, AIN1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(AIN2_GPIO_Port, AIN2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(BIN1_GPIO_Port, BIN1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(BIN2_GPIO_Port, BIN2_Pin, GPIO_PIN_RESET);
+}
+
+/* 엔코더 읽기: 16비트 카운터가 넘어가도(65535 → 0) 차이를 int16_t로 계산하면
+ * 증가/감소량이 올바르게 나옴. 이제 TIM6 인터럽트에서 10ms마다 호출 */
+void encoder_update(void)
+{
+  uint16_t now_a = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);   /* 채널 A 모터 엔코더 */
+  uint16_t now_b = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);   /* 채널 B 모터 엔코더 */
+
+  /* 각 채널의 증가량을 "차가 앞으로 가면 +" 기준으로 바꿈
+   * (모터 방향을 뒤집은 채널은 엔코더도 같이 뒤집어야 PI가 반대로 폭주하지 않음) */
+  int32_t d_a = ENC_A_DIR * MOTOR_A_DIR * (int16_t)(now_a - enc_left_prev);
+  int32_t d_b = ENC_B_DIR * MOTOR_B_DIR * (int16_t)(now_b - enc_right_prev);
+
+  /* 차의 실제 왼쪽/오른쪽에 더하기 */
+  enc_left_total  += SWAP_LR ? d_b : d_a;
+  enc_right_total += SWAP_LR ? d_a : d_b;
+
+  enc_left_prev  = now_a;   /* 변수 이름과 달리 prev는 TIM2(A)/TIM3(B) 원래 값 저장용 */
+  enc_right_prev = now_b;
+}
+
+/* 목표 속도 지정 [cnt/10ms]: set_speed(20, 20) 전진, set_speed(0, 0) 정지 */
+void set_speed(int left, int right)
+{
+  target_l = left;
+  target_r = right;
+}
+
+/* 바퀴 하나의 PI 계산 → PWM 반환 */
+static int pi_calc(int target, int speed, float *integ)
+{
+  if (target == 0) {          /* 정지 명령이면 누적값도 비우고 PWM 0 */
+    *integ = 0.0f;
+    return 0;
+  }
+
+  float err = (float)(target - speed);
+  *integ += err;
+
+  /* 안티 와인드업: I항만으로 PWM_LIMIT를 넘지 않게 누적값 제한
+   * (바퀴를 손으로 오래 잡고 있어도 누적값이 끝없이 커지지 않게) */
+  float i_max = (float)PWM_LIMIT / KI;
+  if (*integ >  i_max) *integ =  i_max;
+  if (*integ < -i_max) *integ = -i_max;
+
+  float out = KF * target + KP * err + KI * (*integ);
+  if (out >  PWM_LIMIT) out =  PWM_LIMIT;
+  if (out < -PWM_LIMIT) out = -PWM_LIMIT;
+  return (int)out;
+}
+
+/* 10ms마다 실행: 속도 측정 → PI 계산 → PWM 출력 */
+static void speed_control_step(void)
+{
+  int32_t prev_l = enc_left_total;
+  int32_t prev_r = enc_right_total;
+  encoder_update();
+  speed_l = (int)(enc_left_total  - prev_l);
+  speed_r = (int)(enc_right_total - prev_r);
+
+  pwm_l = pi_calc(target_l, speed_l, &integ_l);
+  pwm_r = pi_calc(target_r, speed_r, &integ_r);
+  drive_pwm(pwm_l, pwm_r);
+}
+
+/* ---------------- 명령 인터페이스 ---------------- */
+
+/* 사용법 출력 */
+static void print_help(void)
+{
+  printf("\r\nCommands (speed: 0~%d cnt/10ms, default %d)\r\n", CMD_MAX_SPEED, CMD_DEFAULT_SPEED);
+  printf("  F n : forward      B n : backward\r\n");
+  printf("  L n : turn left    R n : turn right\r\n");
+  printf("  S   : stop         ?   : status\r\n");
+  printf("  ATMODE : HC-05 AT setting mode (PC terminal only)\r\n> ");
+}
+
+/* 현재 상태 한 줄 출력 */
+static void print_status(void)
+{
+  printf("tgt L=%d R=%d | spd L=%d R=%d | pwm L=%d R=%d | enc L=%ld R=%ld\r\n",
+         target_l, target_r, speed_l, speed_r, pwm_l, pwm_r,
+         (long)enc_left_total, (long)enc_right_total);
+}
+
+/* 대소문자 무시하고 두 문자열이 같은지 */
+static int str_eq_nocase(const char *a, const char *b)
+{
+  while (*a && *b) {
+    if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return 0;
+    a++; b++;
+  }
+  return (*a == '\0' && *b == '\0');
+}
+
+/* 명령 한 줄 해석·실행. 예: "F 20", "r15", "s", "?" */
+static void process_command(char *line)
+{
+  while (*line == ' ') line++;              /* 앞 공백 건너뛰기 */
+  if (*line == '\0') return;                /* 빈 줄은 무시 */
+
+  /* ATMODE: 한 글자 명령보다 먼저 검사 (안 그러면 'A'로 시작하는 다른 명령처럼 해석됨)
+   * HC-05 자신을 설정하는 모드라 PC 터미널에서만 허용 */
+  if (str_eq_nocase(line, "ATMODE")) {
+    if (out_uart == &huart2) at_bridge_enter();
+    else printf("ERR ATMODE: PC only\r\n");
+    return;
+  }
+
+  /* 무슨 명령이든 들어왔다 = 아직 연결이 살아 있다 → 타임아웃 시계 다시 시작 */
+  last_cmd_tick = HAL_GetTick();
+  last_cmd_uart = out_uart;
+
+  char cmd = (char)toupper((unsigned char)line[0]);
+
+  /* 숫자 부분: 없으면 기본 속도 */
+  int v = CMD_DEFAULT_SPEED;
+  char *num = line + 1;
+  while (*num == ' ') num++;
+  if (*num != '\0') {
+    if (!isdigit((unsigned char)*num)) { printf("ERR bad number\r\n"); return; }
+    v = atoi(num);
+  }
+  if (v > CMD_MAX_SPEED) { printf("ERR max %d\r\n", CMD_MAX_SPEED); return; }
+
+  switch (cmd) {
+    case 'F': set_speed( v,  v); printf("OK F %d\r\n", v); break;
+    case 'B': set_speed(-v, -v); printf("OK B %d\r\n", v); break;
+    case 'L': set_speed(-v,  v); printf("OK L %d\r\n", v); break;   /* 왼쪽 뒤로, 오른쪽 앞으로 */
+    case 'R': set_speed( v, -v); printf("OK R %d\r\n", v); break;   /* 왼쪽 앞으로, 오른쪽 뒤로 */
+    case 'S': set_speed( 0,  0); printf("OK S\r\n");        break;
+    case '?': print_status();                                  break;
+    case 'H': print_help();                                    return;
+    default:  printf("ERR unknown '%c' (H: help)\r\n", line[0]); break;
+  }
+}
+
+/* 한 통로의 링버퍼에서 글자를 꺼내 한 줄로 모으고, Enter가 오면 실행
+ * 답장은 그 명령이 들어온 통로로 보냄 */
+static void port_poll(cmd_port_t *p)
+{
+  out_uart = p->huart;
+  while (p->tail != p->head) {
+    char c = (char)p->ring[p->tail & (RX_RING_SIZE - 1)];
+    p->tail++;
+
+    if (c == '\r' || c == '\n') {            /* Enter: 한 줄 완성 (CR+LF면 두 번째는 빈 줄이라 무시됨) */
+      if (p->len > 0) {
+        if (p->interactive) printf("\r\n");
+        p->line[p->len] = '\0';
+        process_command(p->line);
+        p->len = 0;
+        if (p->interactive) printf("> ");
+      }
+    } else if (c == '\b' || c == 0x7F) {      /* 백스페이스: 한 글자 지우기 */
+      if (p->len > 0) {
+        p->len--;
+        if (p->interactive) printf("\b \b");
+      }
+    } else if (p->len < CMD_LINE_MAX - 1) {
+      p->line[p->len++] = c;
+      if (p->interactive) HAL_UART_Transmit(p->huart, (uint8_t *)&c, 1, HAL_MAX_DELAY);  /* 에코 */
+    }
+  }
+  out_uart = &huart2;
+}
+
+/* 두 통로 모두 확인 */
+static void uart_poll_commands(void)
+{
+  port_poll(&port_pc);
+  port_poll(&port_bt);
+}
+
+/* 안전장치: 움직이는 중인데 CMD_TIMEOUT_MS 동안 명령이 없으면 정지 */
+static void check_cmd_timeout(void)
+{
+  if ((target_l != 0 || target_r != 0) &&
+      (HAL_GetTick() - last_cmd_tick > CMD_TIMEOUT_MS)) {
+    set_speed(0, 0);
+    out_uart = last_cmd_uart;
+    printf("STOP (timeout)\r\n");
+    out_uart = &huart2;
+  }
+}
+
+/* ---------------- HC-05 AT 중계 모드 ---------------- */
+
+/* HC-05 쪽 UART(USART1) 속도를 바꿈: 받던 걸 멈추고 → 새 속도로 다시 설정 → 다시 받기 시작 */
+static void bt_set_baud(uint32_t baud)
+{
+  HAL_UART_AbortReceive_IT(&huart1);
+  huart1.Init.BaudRate = baud;
+  if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
+  port_bt.tail = port_bt.head;   /* 이전 속도로 받은 깨진 글자 버리기 */
+  port_bt.len  = 0;
+  HAL_UART_Receive_IT(&huart1, &port_bt.rx_byte, 1);
+}
+
+/* AT 중계 모드 시작: 모터 멈추고 HC-05 쪽을 38400으로 */
+static void at_bridge_enter(void)
+{
+  set_speed(0, 0);
+  bt_set_baud(BT_BAUD_AT);
+  at_bridge = 1;
+  printf("=== HC-05 AT mode (%d bps) ===\r\n", BT_BAUD_AT);
+  printf("1) Unplug HC-05 VCC\r\n");
+  printf("2) Hold the button on HC-05 and plug VCC back in\r\n");
+  printf("3) LED blinks slowly (2s on / 2s off) -> release button\r\n");
+  printf("Type AT commands (AT, AT+PSWD?, AT+UART? ...). EXIT to quit.\r\n> ");
+}
+
+/* AT 중계 모드 끝: HC-05 쪽을 평소 속도(9600)로 되돌림 */
+static void at_bridge_exit(void)
+{
+  at_bridge = 0;
+  bt_set_baud(BT_BAUD_DATA);
+  printf("=== AT mode off. Unplug/replug HC-05 VCC (without button) ===\r\n> ");
+}
+
+/* AT 중계 모드 동작
+ * - HC-05가 보낸 글자 → 그대로 PC 터미널에 출력
+ * - PC에서 친 줄 → Enter 치면 끝에 CR+LF 붙여서 HC-05로 전송 (AT 명령은 CR+LF로 끝나야 함) */
+static void at_bridge_poll(void)
+{
+  /* HC-05 → PC */
+  while (port_bt.tail != port_bt.head) {
+    uint8_t c = port_bt.ring[port_bt.tail & (RX_RING_SIZE - 1)];
+    port_bt.tail++;
+    HAL_UART_Transmit(&huart2, &c, 1, HAL_MAX_DELAY);
+  }
+
+  /* PC → HC-05 (한 줄씩) */
+  cmd_port_t *p = &port_pc;
+  while (p->tail != p->head) {
+    char c = (char)p->ring[p->tail & (RX_RING_SIZE - 1)];
+    p->tail++;
+
+    if (c == '\r' || c == '\n') {
+      if (p->len > 0) {
+        p->line[p->len] = '\0';
+        printf("\r\n");
+        if (str_eq_nocase(p->line, "EXIT")) {
+          p->len = 0;
+          at_bridge_exit();
+          return;
+        }
+        HAL_UART_Transmit(&huart1, (uint8_t *)p->line, p->len, HAL_MAX_DELAY);
+        HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
+        p->len = 0;
+      }
+    } else if (c == '\b' || c == 0x7F) {
+      if (p->len > 0) { p->len--; printf("\b \b"); }
+    } else if (p->len < CMD_LINE_MAX - 1) {
+      p->line[p->len++] = c;
+      HAL_UART_Transmit(&huart2, (uint8_t *)&c, 1, HAL_MAX_DELAY);  /* 에코 */
+    }
+  }
+}
+
+/* 수신 인터럽트에서 부름: 받은 1글자를 링버퍼에 넣고 다음 1글자 수신을 다시 걸어둠 */
+static void port_rx_isr(cmd_port_t *p)
+{
+  p->ring[p->head & (RX_RING_SIZE - 1)] = p->rx_byte;
+  p->head++;
+  HAL_UART_Receive_IT(p->huart, &p->rx_byte, 1);
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_TIM1_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  MX_USART2_UART_Init();
+  MX_TIM6_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  /* 1) PWM 출력 시작: CubeMX는 설정만 해두고, 실제 출력은 여기서 켜야 함 */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+
+  /* 2) 엔코더 카운트 시작 (A상·B상 둘 다 사용) */
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  enc_left_prev  = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  enc_right_prev = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+
+  /* 3) 정지 상태로 시작한 뒤 TB6612 깨우기 (STBY = HIGH) */
+  motor_stop();
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
+
+  printf("\r\n=== firecar command mode ===\r\n");
+  HAL_Delay(2000);   /* 전원 넣고 차를 들어 올릴 시간 */
+
+  /* 4) 10ms 제어 타이머 시작 → 이때부터 HAL_TIM_PeriodElapsedCallback이 10ms마다 불림 */
+  HAL_TIM_Base_Start_IT(&htim6);
+
+  /* 5) UART 1글자 수신 인터럽트 시작 (PC, 블루투스 둘 다)
+   *    → 글자가 오면 HAL_UART_RxCpltCallback 호출 */
+  HAL_UART_Receive_IT(port_pc.huart, &port_pc.rx_byte, 1);
+  HAL_UART_Receive_IT(port_bt.huart, &port_bt.rx_byte, 1);
+  print_help();
+
+  out_uart = &huart1;
+  printf("firecar BT ready (H: help)\r\n");   /* 폰이 연결돼 있으면 보임 */
+  out_uart = &huart2;
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    /* 받은 글자가 있으면 명령으로 처리 (PID는 TIM6 인터럽트에서 따로 돌고 있음) */
+    if (at_bridge) {
+      at_bridge_poll();        /* HC-05 설정 중: PC ↔ HC-05 중계만 */
+    } else {
+      uart_poll_commands();    /* 평소: 명령 처리 */
+      check_cmd_timeout();
+    }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+/* 타이머 주기 인터럽트 콜백: HAL이 TIM6 업데이트 인터럽트마다(10ms) 불러줌 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6) {
+    speed_control_step();
+  }
+}
+
+/* UART 1글자 수신 완료 콜백: 어느 UART인지 보고 그 통로의 링버퍼에 넣음
+ * (HAL_UART_Receive_IT는 1번 받으면 끝나므로 port_rx_isr에서 매번 다시 호출) */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)      port_rx_isr(&port_pc);
+  else if (huart->Instance == USART1) port_rx_isr(&port_bt);
+}
+
+/* 수신 에러(오버런 등)가 나면 HAL이 수신을 멈추므로 다시 시작 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)      HAL_UART_Receive_IT(&huart2, &port_pc.rx_byte, 1);
+  else if (huart->Instance == USART1) HAL_UART_Receive_IT(&huart1, &port_bt.rx_byte, 1);
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

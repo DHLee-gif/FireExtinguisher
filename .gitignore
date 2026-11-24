@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 web/static/uploads/
+
+stm32/**/Debug/
+stm32/**/Release/
