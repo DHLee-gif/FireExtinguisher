@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -85,6 +86,33 @@
 /* HC-05 통신 속도: 평소(데이터 모드) 9600, AT 설정 모드는 38400으로 고정 */
 #define BT_BAUD_DATA       9600
 #define BT_BAUD_AT         38400
+
+/* ---- I2C 센서 (I2C1: D15=SCL/PB8, D14=SDA/PB9) ----
+ * HAL 함수에는 7비트 주소를 왼쪽으로 1칸 민 값(<<1)을 넘겨야 함 */
+#define MPU_ADDR           (0x68 << 1)   /* MPU6050 (AD0 핀 비움 = 0x68) */
+#define MPU_WHO_AM_I       0x75          /* 칩 확인용, 정품은 0x68을 돌려줌 */
+#define MPU_PWR_MGMT_1     0x6B          /* 전원 켜면 잠든 상태 → 여기에 써서 깨움 */
+#define MPU_CONFIG         0x1A          /* 디지털 저역통과필터(떨림 줄이기) */
+#define MPU_GYRO_CONFIG    0x1B          /* 자이로 측정 범위 */
+#define MPU_GYRO_ZOUT_H    0x47          /* 자이로 Z축 값 (상위 바이트, 다음 주소가 하위) */
+#define GYRO_LSB_PER_DPS   65.5f         /* ±500°/s 범위일 때 1°/s = 65.5 */
+#define IMU_PERIOD_MS      5             /* 자이로 읽는 주기 */
+#define GYRO_CAL_SAMPLES   200           /* 시작할 때 영점 잡기용 샘플 수 (5ms × 200 = 1초) */
+#define BOOT_WAIT_MS       5000          /* 전원 넣고 손 뗄 시간 (이 뒤에 영점을 잡음) */
+#define IMU_STALE_MS       50            /* 자이로를 이 시간 넘게 못 읽으면 "각도 못 믿음" → 회전 중이면 즉시 정지 */
+#define IMU_RECOVER_MS     200           /* I2C 복구 시도 간격 */
+
+/* 자동 영점 보정: 바퀴가 멈춰 있고 회전이 이 값보다 작으면 "가만히 있는 중"으로 보고
+ * 영점을 아주 조금씩(GYRO_BIAS_ALPHA 비율만큼) 지금 값 쪽으로 옮김 */
+#define GYRO_STILL_DPS     3.0f
+#define GYRO_BIAS_ALPHA    0.002f        /* 5ms마다 0.2%씩 → 약 2.5초에 걸쳐 따라감 */
+
+/* ---- 각도 회전 명령 T ---- */
+#define TURN_TOL_DEG       2.0f          /* 목표와 이만큼 가까우면 도착으로 봄 */
+#define TURN_KP            0.4f          /* 남은 각도 1°당 속도 0.4 → 남은 각도가 줄수록 느려짐 */
+#define TURN_MIN_SPD       6             /* 이보다 느리면 바퀴가 출발을 못 함 */
+#define TURN_MAX_SPD       18            /* 너무 빠르면 관성으로 멀리 지나침 */
+#define TURN_TIMEOUT_MS    6000          /* 이 시간 안에 못 끝내면 멈춤 (바퀴가 걸렸을 때 대비) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -132,6 +160,23 @@ static UART_HandleTypeDef *out_uart = &huart2;
 static uint32_t last_cmd_tick = 0;
 static UART_HandleTypeDef *last_cmd_uart = &huart2;
 
+/* IMU(MPU6050) 상태 */
+static uint8_t  imu_ok = 0;          /* 1: MPU6050 초기화 성공 */
+static float    gyro_bias_z = 0.0f;  /* 가만히 있을 때의 자이로 Z 값 (영점) */
+static float    gyro_rate_z = 0.0f;  /* 현재 회전 속도 [°/s], 위에서 봤을 때 반시계(왼쪽)가 + */
+static float    yaw_deg = 0.0f;      /* 누적 회전 각도 [°] */
+static uint32_t imu_t_prev = 0;      /* 마지막으로 자이로를 읽은 시각 [ms] */
+static uint32_t imu_last_ok = 0;     /* 마지막으로 읽기에 성공한 시각 [ms] */
+static uint32_t imu_err_count = 0;   /* 읽기 실패 횟수 (모터 잡음 등으로 I2C가 깨진 횟수) */
+static uint32_t imu_recover_count = 0; /* I2C 버스 복구를 한 횟수 */
+static uint32_t imu_recover_tick = 0;  /* 마지막 복구 시도 시각 */
+
+/* T 명령(각도 회전) 상태 */
+static uint8_t  turning = 0;         /* 1: 회전 중 */
+static float    turn_target = 0.0f;  /* 도착해야 할 yaw [°] */
+static int8_t   turn_dir = 0;        /* 처음 출발 방향: +1 왼쪽, -1 오른쪽 */
+static uint32_t turn_t0 = 0;         /* 회전 시작 시각 */
+
 /* AT 중계 모드: 1이면 PC 터미널 ↔ HC-05를 그대로 이어줌 (HC-05 설정 확인·변경용) */
 static uint8_t at_bridge = 0;
 /* USER CODE END PV */
@@ -147,6 +192,13 @@ void set_speed(int left, int right);
 static void process_command(char *line);
 static void at_bridge_enter(void);
 static void print_status(void);
+static void i2c_scan(void);
+static void imu_init(void);
+static void imu_update(void);
+static void mpu_config(void);
+static void i2c_bus_recover(void);
+static void turn_start(int angle);
+static void turn_update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -273,6 +325,209 @@ static void speed_control_step(void)
   drive_pwm(pwm_l, pwm_r);
 }
 
+/* ---------------- I2C 센서 (MPU6050 자이로) ---------------- */
+
+/* I2C 주소 1~127에 하나씩 "있어요?" 하고 물어봐서 대답한 주소를 출력
+ * 0x68 = MPU6050, 0x0D = QMC5883L 나침반, 0x1E = HMC5883L 나침반 */
+static void i2c_scan(void)
+{
+  int found = 0;
+  printf("I2C scan:");
+  for (uint16_t addr = 1; addr < 128; addr++) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 1, 2) == HAL_OK) {
+      printf(" 0x%02X", addr);
+      found++;
+    }
+  }
+  printf(found ? "\r\n" : " none (check wiring)\r\n");
+}
+
+/* MPU6050 레지스터 1개 쓰기 */
+static HAL_StatusTypeDef mpu_write(uint8_t reg, uint8_t val)
+{
+  return HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 10);
+}
+
+/* 자이로 Z축 원시값 읽기 (16비트, 부호 있음) */
+static HAL_StatusTypeDef mpu_read_gz(int16_t *gz)
+{
+  uint8_t b[2];
+  HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, MPU_GYRO_ZOUT_H, I2C_MEMADD_SIZE_8BIT, b, 2, 10);
+  if (st == HAL_OK) *gz = (int16_t)((b[0] << 8) | b[1]);
+  return st;
+}
+
+/* MPU6050 깨우기 + 필터·측정 범위 설정 (복구 후에도 다시 부름) */
+static void mpu_config(void)
+{
+  mpu_write(MPU_PWR_MGMT_1, 0x01);   /* 잠 깨우기 + 자이로 X축 클럭을 기준으로 사용(더 안정적) */
+  HAL_Delay(100);
+  mpu_write(MPU_CONFIG, 0x03);       /* 저역통과필터 약 44Hz: 모터 진동 같은 빠른 떨림을 걸러냄 */
+  mpu_write(MPU_GYRO_CONFIG, 0x08);  /* ±500°/s 범위: 제자리 회전도 넘치지 않을 만큼 넉넉함 */
+  HAL_Delay(50);
+}
+
+/* I2C 버스 복구
+ * 모터 잡음 때문에 통신 도중 신호가 깨지면, 센서가 SDA를 LOW로 붙잡은 채 멈추거나
+ * STM32 I2C가 "바쁨(BUSY)" 상태에 갇혀서 그 뒤 읽기가 전부 실패함.
+ * → I2C를 끄고, SCL을 손으로 9번 흔들어 센서가 하던 전송을 끝내게 한 뒤, STOP 신호를 만들고, I2C를 리셋·재시작 */
+static void i2c_bus_recover(void)
+{
+  GPIO_InitTypeDef g = {0};
+
+  HAL_I2C_DeInit(&hi2c1);                       /* I2C 끄기 (핀도 해제) */
+
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+  g.Pin   = GPIO_PIN_8 | GPIO_PIN_9;            /* PB8 = SCL, PB9 = SDA 를 일반 출력(오픈 드레인)으로 */
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &g);
+
+  for (int i = 0; i < 9; i++) {                 /* SCL 클럭 9번 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   HAL_Delay(1);
+  }
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET); HAL_Delay(1);   /* STOP: SCL이 HIGH일 때 SDA LOW→HIGH */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   HAL_Delay(1);
+
+  __HAL_RCC_I2C1_FORCE_RESET();                 /* I2C 하드웨어 자체를 리셋 → 갇힌 BUSY 해제 */
+  __HAL_RCC_I2C1_RELEASE_RESET();
+  MX_I2C1_Init();                               /* CubeMX 설정 그대로 다시 켜기 (핀도 다시 I2C로) */
+  imu_recover_count++;
+}
+
+/* MPU6050 깨우고 설정한 뒤, 1초 동안 가만히 있을 때 값을 평균 내서 영점 잡기
+ * → 이 1초 동안 차를 건드리면 영점이 틀어져서 가만히 있어도 각도가 흘러감 */
+static void imu_init(void)
+{
+  uint8_t who = 0;
+  imu_ok = 0;
+
+  if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, MPU_WHO_AM_I, I2C_MEMADD_SIZE_8BIT, &who, 1, 10) != HAL_OK) {
+    printf("IMU: no answer at 0x68 (check SCL=D15, SDA=D14, 3.3V, GND)\r\n");
+    return;
+  }
+  printf("IMU: WHO_AM_I = 0x%02X %s\r\n", who, (who == 0x68) ? "(MPU6050 OK)" : "(not 0x68: clone chip? continuing)");
+
+  mpu_config();
+
+  printf("IMU: calibrating, keep the car still...\r\n");
+  int32_t sum = 0;
+  int16_t gz;
+  for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+    if (mpu_read_gz(&gz) != HAL_OK) { printf("IMU: read error\r\n"); return; }
+    sum += gz;
+    HAL_Delay(IMU_PERIOD_MS);
+  }
+  gyro_bias_z = (float)sum / GYRO_CAL_SAMPLES;
+  yaw_deg = 0.0f;
+  imu_t_prev = HAL_GetTick();
+  imu_last_ok = imu_t_prev;
+  imu_ok = 1;
+  printf("IMU: ready (bias=%d raw)\r\n", (int)gyro_bias_z);
+}
+
+/* 메인 루프에서 계속 호출: 5ms마다 자이로를 읽어 회전 속도 × 지난 시간을 각도에 더함
+ * 각도 = Σ(각속도 × 시간). 지난 시간(dt)을 실제로 재서 곱하므로, 출력 때문에 주기가 조금 밀려도 맞게 쌓임 */
+static void imu_update(void)
+{
+  if (!imu_ok) return;
+  uint32_t now = HAL_GetTick();
+  if (now - imu_t_prev < IMU_PERIOD_MS) return;
+
+  int16_t gz;
+  if (mpu_read_gz(&gz) != HAL_OK) {
+    /* 읽기 실패: 각도를 더하지 않고, 실패가 계속되면 버스 복구 시도 */
+    imu_err_count++;
+    if (now - imu_last_ok > IMU_STALE_MS && now - imu_recover_tick > IMU_RECOVER_MS) {
+      imu_recover_tick = now;
+      i2c_bus_recover();
+      mpu_config();
+    }
+    return;
+  }
+
+  float dt = (now - imu_t_prev) / 1000.0f;
+  imu_t_prev = now;
+  imu_last_ok = now;
+  /* 실패로 한참 못 읽다가 다시 읽힌 경우, 그 사이 회전은 알 수 없으므로 더하지 않음
+   * (지금 속도 × 긴 시간을 더하면 엉뚱한 값이 됨) */
+  if (dt > (IMU_STALE_MS / 1000.0f)) return;
+
+  gyro_rate_z = ((float)gz - gyro_bias_z) / GYRO_LSB_PER_DPS;
+  yaw_deg += gyro_rate_z * dt;
+
+  /* 자동 영점 보정
+   * 조건: 바퀴 명령 0 + 엔코더도 0(실제로 안 굴러감) + 회전 중 아님 + 자이로 값이 작음
+   * → 이때 남아 있는 작은 회전값은 진짜 회전이 아니라 영점 오차로 보고 조금씩 흡수
+   * (손으로 빠르게 돌릴 때는 GYRO_STILL_DPS를 넘어서 보정하지 않음) */
+  if (target_l == 0 && target_r == 0 && speed_l == 0 && speed_r == 0 && !turning &&
+      gyro_rate_z < GYRO_STILL_DPS && gyro_rate_z > -GYRO_STILL_DPS) {
+    gyro_bias_z += GYRO_BIAS_ALPHA * ((float)gz - gyro_bias_z);
+  }
+}
+
+/* ---------------- T 명령: 자이로로 정확히 n도 돌기 ---------------- */
+
+/* 회전 시작: 목표 yaw = 지금 yaw + angle (왼쪽 +, 오른쪽 -) */
+static void turn_start(int angle)
+{
+  if (!imu_ok) { printf("ERR T: IMU not ready (send I)\r\n"); return; }
+  if (angle == 0) { printf("OK T 0\r\n"); return; }
+  turn_target = yaw_deg + (float)angle;
+  turn_dir = (angle > 0) ? 1 : -1;
+  turn_t0 = HAL_GetTick();
+  turning = 1;
+  printf("OK T %d\r\n", angle);
+}
+
+/* 메인 루프에서 계속 호출: 남은 각도에 비례해서 회전 속도를 정하고, 도착하면 멈춤
+ * - 멀리 남았으면 빠르게, 가까워질수록 천천히 → 관성으로 지나치는 걸 줄임
+ * - 목표를 지나쳤으면(남은 각도 부호가 바뀜) 되돌아가지 않고 바로 멈춤 → 왔다갔다 떨지 않음 */
+static void turn_update(void)
+{
+  if (!turning) return;
+
+  /* 자이로를 못 읽고 있으면 각도를 믿을 수 없으므로 바로 멈춤
+   * (이걸 안 하면 각도가 멈춘 채로 목표에 영영 못 가서, 차가 계속 빙빙 돎) */
+  if (HAL_GetTick() - imu_last_ok > IMU_STALE_MS) {
+    set_speed(0, 0);
+    turning = 0;
+    out_uart = last_cmd_uart;
+    printf("ERR T: IMU read failed (i2c err=%lu) - stopped\r\n", (unsigned long)imu_err_count);
+    out_uart = &huart2;
+    return;
+  }
+
+  float err = turn_target - yaw_deg;          /* 남은 각도, +면 아직 왼쪽으로 더 돌아야 함 */
+  uint8_t passed = (turn_dir > 0) ? (err < 0) : (err > 0);
+  uint8_t timeout = (HAL_GetTick() - turn_t0) > TURN_TIMEOUT_MS;
+
+  if (passed || (err < TURN_TOL_DEG && err > -TURN_TOL_DEG) || timeout) {
+    set_speed(0, 0);
+    turning = 0;
+    int y10 = (int)(yaw_deg * 10.0f);
+    out_uart = last_cmd_uart;
+    printf("%s T yaw=%s%d.%d deg\r\n", timeout ? "ERR timeout" : "DONE",
+           y10 < 0 ? "-" : "", abs(y10) / 10, abs(y10) % 10);
+    out_uart = &huart2;
+    return;
+  }
+
+  float a = (err > 0) ? err : -err;
+  int spd = (int)(TURN_KP * a);
+  if (spd < TURN_MIN_SPD) spd = TURN_MIN_SPD;
+  if (spd > TURN_MAX_SPD) spd = TURN_MAX_SPD;
+
+  if (err > 0) set_speed(-spd,  spd);   /* 왼쪽으로 돌기 */
+  else         set_speed( spd, -spd);   /* 오른쪽으로 돌기 */
+
+  last_cmd_tick = HAL_GetTick();         /* 회전 중에는 명령 타임아웃으로 멈추지 않게 (회전 자체 타임아웃이 있음) */
+}
+
 /* ---------------- 명령 인터페이스 ---------------- */
 
 /* 사용법 출력 */
@@ -282,6 +537,8 @@ static void print_help(void)
   printf("  F n : forward      B n : backward\r\n");
   printf("  L n : turn left    R n : turn right\r\n");
   printf("  S   : stop         ?   : status\r\n");
+  printf("  Z   : yaw = 0      I   : I2C scan + IMU re-init\r\n");
+  printf("  T n : turn n deg in place (+ left, - right, e.g. T 90, T -90)\r\n");
   printf("  ATMODE : HC-05 AT setting mode (PC terminal only)\r\n> ");
 }
 
@@ -291,6 +548,15 @@ static void print_status(void)
   printf("tgt L=%d R=%d | spd L=%d R=%d | pwm L=%d R=%d | enc L=%ld R=%ld\r\n",
          target_l, target_r, speed_l, speed_r, pwm_l, pwm_r,
          (long)enc_left_total, (long)enc_right_total);
+  /* 실수 printf는 기본 설정에서 안 나오므로 0.1° 단위 정수로 출력 */
+  int yaw10  = (int)(yaw_deg * 10.0f);
+  int rate10 = (int)(gyro_rate_z * 10.0f);
+  printf("imu %s | yaw=%s%d.%d deg | gz=%s%d.%d deg/s | i2c err=%lu recover=%lu last_ok=%lums ago\r\n",
+         imu_ok ? "OK" : "NONE",
+         yaw10 < 0 ? "-" : "", abs(yaw10) / 10, abs(yaw10) % 10,
+         rate10 < 0 ? "-" : "", abs(rate10) / 10, abs(rate10) % 10,
+         (unsigned long)imu_err_count, (unsigned long)imu_recover_count,
+         (unsigned long)(HAL_GetTick() - imu_last_ok));
 }
 
 /* 대소문자 무시하고 두 문자열이 같은지 */
@@ -323,6 +589,23 @@ static void process_command(char *line)
 
   char cmd = (char)toupper((unsigned char)line[0]);
 
+  /* 회전 중에 다른 명령(상태 조회 ? 제외)이 오면 회전 취소 → 그 명령이 우선 */
+  if (cmd != '?') turning = 0;
+
+  /* T: 각도는 음수(오른쪽)도 있고 범위도 속도와 달라서 따로 처리 */
+  if (cmd == 'T') {
+    char *p = line + 1;
+    while (*p == ' ') p++;
+    if (!(isdigit((unsigned char)*p) || ((*p == '-' || *p == '+') && isdigit((unsigned char)p[1])))) {
+      printf("ERR T needs angle (e.g. T 90, T -90)\r\n");
+      return;
+    }
+    int ang = atoi(p);
+    if (ang > 360 || ang < -360) { printf("ERR T range -360~360\r\n"); return; }
+    turn_start(ang);
+    return;
+  }
+
   /* 숫자 부분: 없으면 기본 속도 */
   int v = CMD_DEFAULT_SPEED;
   char *num = line + 1;
@@ -341,6 +624,9 @@ static void process_command(char *line)
     case 'S': set_speed( 0,  0); printf("OK S\r\n");        break;
     case '?': print_status();                                  break;
     case 'H': print_help();                                    return;
+    case 'Z': yaw_deg = 0.0f; printf("OK Z (yaw=0)\r\n");     break;
+    case 'I': imu_err_count = 0; imu_recover_count = 0;
+              i2c_scan(); imu_init();                          break;
     default:  printf("ERR unknown '%c' (H: help)\r\n", line[0]); break;
   }
 }
@@ -512,6 +798,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM6_Init();
   MX_USART1_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   /* 1) PWM 출력 시작: CubeMX는 설정만 해두고, 실제 출력은 여기서 켜야 함 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -528,7 +815,12 @@ int main(void)
   HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
 
   printf("\r\n=== firecar command mode ===\r\n");
-  HAL_Delay(2000);   /* 전원 넣고 차를 들어 올릴 시간 */
+  printf("Hands off: calibrating in %d s...\r\n", BOOT_WAIT_MS / 1000);
+  HAL_Delay(BOOT_WAIT_MS);   /* 전원 넣고 손 뗄 시간 → 그다음 자이로 영점을 잡으므로 차를 건드리지 않기 */
+
+  /* 3-1) I2C 센서 확인 + MPU6050 영점 잡기 (약 1초, 이때 차를 건드리지 않기) */
+  i2c_scan();
+  imu_init();
 
   /* 4) 10ms 제어 타이머 시작 → 이때부터 HAL_TIM_PeriodElapsedCallback이 10ms마다 불림 */
   HAL_TIM_Base_Start_IT(&htim6);
@@ -556,6 +848,8 @@ int main(void)
       at_bridge_poll();        /* HC-05 설정 중: PC ↔ HC-05 중계만 */
     } else {
       uart_poll_commands();    /* 평소: 명령 처리 */
+      imu_update();            /* 자이로 읽어서 각도 누적 */
+      turn_update();           /* T 명령 회전 중이면 속도 조절·도착 판단 */
       check_cmd_timeout();
     }
   }

@@ -58,8 +58,8 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(BIN2_GPIO_Port, BIN2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : BIN1_Pin AIN2_Pin AIN1_Pin */
-  GPIO_InitStruct.Pin = BIN1_Pin|AIN2_Pin|AIN1_Pin;
+  /*Configure GPIO pins : BIN1_Pin AIN1_Pin */
+  GPIO_InitStruct.Pin = BIN1_Pin|AIN1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -82,8 +82,15 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = BIN2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(BIN2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : AIN2_Pin */
+  GPIO_InitStruct.Pin = AIN2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(AIN2_GPIO_Port, &GPIO_InitStruct);
 
 }
 
