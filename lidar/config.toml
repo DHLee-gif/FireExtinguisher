@@ -1,0 +1,11 @@
+port = "/dev/serial0"   # GPIO UART (핀 10). USB 변환기를 쓰면 /dev/ttyUSB0
+baud = 115200
+forward_angle_deg = 10.0  # 2026-11-26 물병 실측: 케이블 반대쪽이 센서 +10°
+min_range_mm = 120
+max_range_mm = 8000
+expected_frames = 52
+
+# 주행 요약용 차체 치수 (실측해서 바꿀 것. 지금 값은 임시)
+car_width_mm = 200        # 차 폭
+side_margin_mm = 50       # 차 폭 양옆에 더 둘 여유
+side_lookahead_mm = 500   # 옆 여유를 볼 앞쪽 거리
