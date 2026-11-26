@@ -1,0 +1,24 @@
+[Unit]
+Description=LiDAR to STM32 scan bridge
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=song
+SupplementaryGroups=dialout
+WorkingDirectory=/home/song/proj/lidar
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Replace both serial paths and calibrate --forward-angle on the actual car.
+ExecStart=/home/song/proj/.venv/bin/python /home/song/proj/lidar/lidar_bridge.py --lidar-port /dev/serial/by-id/REPLACE_WITH_LIDAR --stm32-port /dev/serial/by-id/REPLACE_WITH_STM32 --forward-angle 0
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

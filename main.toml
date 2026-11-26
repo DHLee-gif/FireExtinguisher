@@ -1,0 +1,9 @@
+# main.py가 프로세스마다 쓸 CPU 코어 (Raspberry Pi 4: 0~3). 이유: docs/timing.md
+# 선 인식은 코어 하나를 혼자 쓰고, 우선순위가 낮은 불 감지·스트리밍은 다른 코어에 둔다.
+# 코어 3은 OS·화면·학습 같은 나머지 작업용으로 비워 둔다.
+[cores]
+camera = [0]
+lidar = [0]
+line = [1]
+fire = [2]
+stream = [2]
