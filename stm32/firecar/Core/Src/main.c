@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>   /* atoi */
 #include <ctype.h>    /* toupper */
+#include <math.h>     /* cosf, sinf, atan2f, sqrtf (오도메트리) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -107,12 +108,40 @@
 #define GYRO_STILL_DPS     3.0f
 #define GYRO_BIAS_ALPHA    0.002f        /* 5ms마다 0.2%씩 → 약 2.5초에 걸쳐 따라감 */
 
+/* 오래 멈춰 있을 때(바퀴가 STILL_LONG_MS 이상 완전히 정지)의 강한 보정
+ * 바퀴가 안 도는데 차가 스스로 돌 수는 없으므로, 큰 오차(최대 STILL_LONG_DPS)도 영점 오차로 보고 빠르게 따라감
+ * 이때는 각도도 더하지 않음(정지 중 각도 고정) → 영점이 틀어져 있어도 가만히 있는 동안 각도가 안 흘러감 */
+#define STILL_LONG_MS      1000
+#define STILL_LONG_DPS     20.0f
+#define GYRO_BIAS_ALPHA_LONG 0.01f       /* 5ms마다 1%씩 → 약 0.5초에 따라감 */
+
+/* 시작할 때 영점 잡기 검사: 1초 동안 값의 (최대-최소)가 이보다 크면 "움직였다"고 보고 다시 잡음 */
+#define GYRO_CAL_MAX_SPREAD 100          /* 약 1.5°/s */
+#define GYRO_CAL_RETRY      5
+
 /* ---- 각도 회전 명령 T ---- */
 #define TURN_TOL_DEG       2.0f          /* 목표와 이만큼 가까우면 도착으로 봄 */
 #define TURN_KP            0.4f          /* 남은 각도 1°당 속도 0.4 → 남은 각도가 줄수록 느려짐 */
 #define TURN_MIN_SPD       6             /* 이보다 느리면 바퀴가 출발을 못 함 */
 #define TURN_MAX_SPD       18            /* 너무 빠르면 관성으로 멀리 지나침 */
 #define TURN_TIMEOUT_MS    6000          /* 이 시간 안에 못 끝내면 멈춤 (바퀴가 걸렸을 때 대비) */
+
+/* ---- 거리 이동 명령 D ---- */
+#define CNT_PER_CM         170.0f        /* 1cm 이동 = 엔코더 약 170카운트 (F 15로 18cm 간 실측: 약 3065카운트) */
+#define DRIVE_MAX_CM       500           /* 한 번에 갈 수 있는 최대 거리 */
+#define DRIVE_TOL_CM       0.5f          /* 남은 거리가 이보다 작으면 도착 */
+#define DRIVE_KP           1.0f          /* 남은 거리 1cm당 속도 1 → 마지막 20cm부터 서서히 느려짐 */
+#define DRIVE_MIN_SPD      6
+#define DRIVE_MAX_SPD      20
+#define HEAD_KP            0.5f          /* 방향 오차 1°당 좌우 속도 차이 0.5 → 휘면 반대쪽으로 살짝 꺾어 직진 유지 */
+#define HEAD_MAX_CORR      5             /* 방향 보정 최대값 (너무 세면 지그재그로 감) */
+
+#define DEG2RAD            0.01745329f   /* π / 180 */
+
+/* ---- 귀소 명령 G ---- */
+#define HOME_TOL_CM        5.0f          /* 집까지 이만큼 가까우면 도착 */
+#define HOME_MAX_TRIES     3             /* 회전+직진을 최대 몇 번 반복해서 다시 조준할지 */
+#define RAD2DEG            57.2957795f   /* 180 / π */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -167,6 +196,7 @@ static float    gyro_rate_z = 0.0f;  /* 현재 회전 속도 [°/s], 위에서 �
 static float    yaw_deg = 0.0f;      /* 누적 회전 각도 [°] */
 static uint32_t imu_t_prev = 0;      /* 마지막으로 자이로를 읽은 시각 [ms] */
 static uint32_t imu_last_ok = 0;     /* 마지막으로 읽기에 성공한 시각 [ms] */
+static uint32_t still_since = 0;     /* 바퀴가 완전히 멈춘 시각 (0이면 움직이는 중) */
 static uint32_t imu_err_count = 0;   /* 읽기 실패 횟수 (모터 잡음 등으로 I2C가 깨진 횟수) */
 static uint32_t imu_recover_count = 0; /* I2C 버스 복구를 한 횟수 */
 static uint32_t imu_recover_tick = 0;  /* 마지막 복구 시도 시각 */
@@ -176,6 +206,30 @@ static uint8_t  turning = 0;         /* 1: 회전 중 */
 static float    turn_target = 0.0f;  /* 도착해야 할 yaw [°] */
 static int8_t   turn_dir = 0;        /* 처음 출발 방향: +1 왼쪽, -1 오른쪽 */
 static uint32_t turn_t0 = 0;         /* 회전 시작 시각 */
+
+/* D 명령(거리 이동) 상태 */
+static uint8_t  driving = 0;         /* 1: 이동 중 */
+static int8_t   drive_dir = 0;       /* +1 전진, -1 후진 */
+static int32_t  drive_start = 0;     /* 출발할 때 좌우 엔코더 평균 */
+static int32_t  drive_goal = 0;      /* 가야 할 카운트 (항상 양수) */
+static float    drive_heading = 0.0f;/* 출발할 때 yaw = 유지할 방향 */
+static uint32_t drive_t0 = 0;
+static uint32_t drive_timeout = 0;   /* 거리에 따라 정해지는 제한 시간 [ms] */
+
+/* 오도메트리: 출발점(집)을 (0,0), 그때 바라본 방향을 0°로 둔 좌표
+ * x = 출발 방향으로 간 거리, y = 출발 방향 기준 왼쪽으로 간 거리 [cm] */
+static float   pos_x = 0.0f;
+static float   pos_y = 0.0f;
+static int32_t odom_enc_prev = 0;    /* 지난번에 읽은 좌우 엔코더 평균 */
+
+/* 각 동작의 결과 (귀소가 다음 단계로 넘어갈지 판단할 때 씀): 0 진행/없음, 1 성공, 2 실패 */
+static uint8_t turn_result = 0;
+static uint8_t drive_result = 0;
+
+/* G 명령(귀소) 상태: 0 꺼짐, 1 집 방향으로 회전 중, 2 집으로 직진 중 */
+static uint8_t homing = 0;
+static uint8_t home_tries = 0;
+static const char *home_result = "DONE";   /* 마지막 정렬 회전 뒤에 보낼 결과 문구 */
 
 /* AT 중계 모드: 1이면 PC 터미널 ↔ HC-05를 그대로 이어줌 (HC-05 설정 확인·변경용) */
 static uint8_t at_bridge = 0;
@@ -199,6 +253,13 @@ static void mpu_config(void);
 static void i2c_bus_recover(void);
 static void turn_start(int angle);
 static void turn_update(void);
+static void drive_start_cmd(int cm);
+static void drive_update(void);
+static void odom_reset(void);
+static void odom_update(void);
+static void home_leg(void);
+static void homing_update(void);
+static void home_face_start(const char *result);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -414,15 +475,23 @@ static void imu_init(void)
 
   mpu_config();
 
-  printf("IMU: calibrating, keep the car still...\r\n");
-  int32_t sum = 0;
-  int16_t gz;
-  for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
-    if (mpu_read_gz(&gz) != HAL_OK) { printf("IMU: read error\r\n"); return; }
-    sum += gz;
-    HAL_Delay(IMU_PERIOD_MS);
+  /* 1초 동안 평균을 내되, 그동안 값이 크게 흔들렸으면(=차가 움직였으면) 다시 잡음 */
+  for (int tryno = 1; tryno <= GYRO_CAL_RETRY; tryno++) {
+    printf("IMU: calibrating, keep the car still... (%d/%d)\r\n", tryno, GYRO_CAL_RETRY);
+    int32_t sum = 0;
+    int16_t gz, gmin = 32767, gmax = -32768;
+    for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+      if (mpu_read_gz(&gz) != HAL_OK) { printf("IMU: read error\r\n"); return; }
+      sum += gz;
+      if (gz < gmin) gmin = gz;
+      if (gz > gmax) gmax = gz;
+      HAL_Delay(IMU_PERIOD_MS);
+    }
+    gyro_bias_z = (float)sum / GYRO_CAL_SAMPLES;
+    if (gmax - gmin <= GYRO_CAL_MAX_SPREAD) break;      /* 충분히 가만히 있었음 → 확정 */
+    printf("IMU: moved during calibration (spread=%d), retrying\r\n", gmax - gmin);
+    if (tryno == GYRO_CAL_RETRY) printf("IMU: WARNING still moving, using last value (send I later)\r\n");
   }
-  gyro_bias_z = (float)sum / GYRO_CAL_SAMPLES;
   yaw_deg = 0.0f;
   imu_t_prev = HAL_GetTick();
   imu_last_ok = imu_t_prev;
@@ -458,14 +527,26 @@ static void imu_update(void)
   if (dt > (IMU_STALE_MS / 1000.0f)) return;
 
   gyro_rate_z = ((float)gz - gyro_bias_z) / GYRO_LSB_PER_DPS;
+
+  /* 바퀴가 완전히 멈춰 있는지 (명령 0 + 엔코더 변화 0 + 동작 중 아님) */
+  uint8_t wheels_still = (target_l == 0 && target_r == 0 && speed_l == 0 && speed_r == 0 &&
+                          !turning && !driving && !homing);
+  if (!wheels_still)        still_since = 0;
+  else if (still_since == 0) still_since = now;
+  uint8_t still_long = wheels_still && (now - still_since >= STILL_LONG_MS);
+  float   a = (gyro_rate_z < 0) ? -gyro_rate_z : gyro_rate_z;
+
+  if (still_long && a < STILL_LONG_DPS) {
+    /* 1초 넘게 바퀴가 멈춰 있음 → 남은 회전값은 영점 오차
+     * 각도는 더하지 않고(고정), 영점을 빠르게 지금 값 쪽으로 옮김 */
+    gyro_bias_z += GYRO_BIAS_ALPHA_LONG * ((float)gz - gyro_bias_z);
+    return;
+  }
+
   yaw_deg += gyro_rate_z * dt;
 
-  /* 자동 영점 보정
-   * 조건: 바퀴 명령 0 + 엔코더도 0(실제로 안 굴러감) + 회전 중 아님 + 자이로 값이 작음
-   * → 이때 남아 있는 작은 회전값은 진짜 회전이 아니라 영점 오차로 보고 조금씩 흡수
-   * (손으로 빠르게 돌릴 때는 GYRO_STILL_DPS를 넘어서 보정하지 않음) */
-  if (target_l == 0 && target_r == 0 && speed_l == 0 && speed_r == 0 && !turning &&
-      gyro_rate_z < GYRO_STILL_DPS && gyro_rate_z > -GYRO_STILL_DPS) {
+  /* 막 멈춘 직후(1초 안)에는 작은 오차만 천천히 보정 (기존 방식) */
+  if (wheels_still && a < GYRO_STILL_DPS) {
     gyro_bias_z += GYRO_BIAS_ALPHA * ((float)gz - gyro_bias_z);
   }
 }
@@ -481,6 +562,7 @@ static void turn_start(int angle)
   turn_dir = (angle > 0) ? 1 : -1;
   turn_t0 = HAL_GetTick();
   turning = 1;
+  turn_result = 0;
   printf("OK T %d\r\n", angle);
 }
 
@@ -498,6 +580,7 @@ static void turn_update(void)
     turning = 0;
     out_uart = last_cmd_uart;
     printf("ERR T: IMU read failed (i2c err=%lu) - stopped\r\n", (unsigned long)imu_err_count);
+    turn_result = 2;
     out_uart = &huart2;
     return;
   }
@@ -513,6 +596,7 @@ static void turn_update(void)
     out_uart = last_cmd_uart;
     printf("%s T yaw=%s%d.%d deg\r\n", timeout ? "ERR timeout" : "DONE",
            y10 < 0 ? "-" : "", abs(y10) / 10, abs(y10) % 10);
+    turn_result = timeout ? 2 : 1;
     out_uart = &huart2;
     return;
   }
@@ -528,6 +612,190 @@ static void turn_update(void)
   last_cmd_tick = HAL_GetTick();         /* 회전 중에는 명령 타임아웃으로 멈추지 않게 (회전 자체 타임아웃이 있음) */
 }
 
+/* ---------------- D 명령: 엔코더로 정확히 n cm 가기 + 자이로로 직진 유지 ---------------- */
+
+/* 좌우 엔코더 평균 = 차 중심이 간 거리 (카운트) */
+static int32_t enc_avg(void)
+{
+  return (enc_left_total + enc_right_total) / 2;
+}
+
+static void drive_start_cmd(int cm)
+{
+  if (cm == 0) { printf("OK D 0\r\n"); return; }
+  drive_dir     = (cm > 0) ? 1 : -1;
+  drive_goal    = (int32_t)((cm > 0 ? cm : -cm) * CNT_PER_CM);
+  drive_start   = enc_avg();
+  drive_heading = yaw_deg;                      /* 지금 바라보는 방향을 그대로 유지 */
+  drive_t0      = HAL_GetTick();
+  /* 제한 시간: 기본 3초 + 1cm당 0.2초 (느린 속도로도 넉넉히 도착할 시간) */
+  drive_timeout = 3000 + (uint32_t)(cm > 0 ? cm : -cm) * 200;
+  driving = 1;
+  drive_result = 0;
+  printf("OK D %d\r\n", cm);
+}
+
+/* 메인 루프에서 계속 호출
+ * 1) 남은 거리 = 목표 카운트 - 지금까지 간 카운트
+ * 2) 속도 = 남은 거리에 비례 (가까워지면 느리게) → 정확히 멈춤
+ * 3) 방향 보정: 출발 때 yaw와 지금 yaw 차이만큼 좌우 속도를 다르게 → 똑바로 감 */
+static void drive_update(void)
+{
+  if (!driving) return;
+
+  int32_t traveled = drive_dir * (enc_avg() - drive_start);   /* 가려는 방향으로 간 카운트 */
+  int32_t remain   = drive_goal - traveled;
+  float   remain_cm = remain / CNT_PER_CM;
+  uint8_t timeout  = (HAL_GetTick() - drive_t0) > drive_timeout;
+
+  if (remain_cm < DRIVE_TOL_CM || timeout) {   /* 도착 (지나친 경우 remain이 음수라 여기 포함) */
+    set_speed(0, 0);
+    driving = 0;
+    int d10 = (int)(traveled * 10 / CNT_PER_CM);
+    int y10 = (int)(yaw_deg * 10.0f);
+    out_uart = last_cmd_uart;
+    printf("%s D moved=%d.%d cm yaw=%s%d.%d deg\r\n", timeout ? "ERR timeout" : "DONE",
+           d10 / 10, abs(d10 % 10), y10 < 0 ? "-" : "", abs(y10) / 10, abs(y10) % 10);
+    drive_result = timeout ? 2 : 1;
+    out_uart = &huart2;
+    return;
+  }
+
+  int base = (int)(DRIVE_KP * remain_cm);
+  if (base < DRIVE_MIN_SPD) base = DRIVE_MIN_SPD;
+  if (base > DRIVE_MAX_SPD) base = DRIVE_MAX_SPD;
+
+  /* 방향 보정: yaw가 줄었다(오른쪽으로 휨) → herr > 0 → 오른쪽 바퀴를 빠르게, 왼쪽을 느리게 → 왼쪽으로 돌아옴
+   * 차가 도는 방향은 (오른쪽 속도 - 왼쪽 속도)로 정해지므로 전진/후진 모두 같은 식 */
+  int corr = 0;
+  if (imu_ok && (HAL_GetTick() - imu_last_ok) <= IMU_STALE_MS) {
+    float herr = drive_heading - yaw_deg;
+    corr = (int)(HEAD_KP * herr);
+    if (corr >  HEAD_MAX_CORR) corr =  HEAD_MAX_CORR;
+    if (corr < -HEAD_MAX_CORR) corr = -HEAD_MAX_CORR;
+  }
+
+  set_speed(drive_dir * base - corr, drive_dir * base + corr);
+  last_cmd_tick = HAL_GetTick();      /* 이동 중에는 명령 타임아웃으로 멈추지 않게 (자체 제한 시간 있음) */
+}
+
+/* ---------------- 오도메트리: 엔코더 거리 + 자이로 방향으로 현재 위치 계산 ---------------- */
+
+/* 지금 자리를 집(원점)으로 정함: 위치 0, 방향 0 */
+static void odom_reset(void)
+{
+  pos_x = 0.0f;
+  pos_y = 0.0f;
+  yaw_deg = 0.0f;
+  odom_enc_prev = enc_avg();
+}
+
+/* 메인 루프에서 계속 호출
+ * 짧은 시간 동안 간 거리 d와 지금 방향 θ로 위치를 조금씩 더함
+ *   x += d·cosθ,  y += d·sinθ
+ * 아주 짧은 직선 조각들을 이어 붙이는 방식이라, 어떤 길로 돌아다녀도 지금 위치가 나옴
+ * (제자리 회전은 좌우 엔코더가 반대로 움직여 평균 변화가 0 → 위치는 그대로, 방향만 바뀜) */
+static void odom_update(void)
+{
+  int32_t now = enc_avg();
+  int32_t d = now - odom_enc_prev;
+  if (d == 0) return;
+  odom_enc_prev = now;
+
+  float d_cm = (float)d / CNT_PER_CM;
+  float th = yaw_deg * DEG2RAD;
+  pos_x += d_cm * cosf(th);
+  pos_y += d_cm * sinf(th);
+}
+
+/* ---------------- G 명령: 집(O로 정한 자리)으로 돌아가기 ---------------- */
+
+/* 귀소 끝: 결과를 명령 보낸 쪽으로 알림 */
+static void home_finish(const char *result)
+{
+  homing = 0;
+  set_speed(0, 0);
+  UART_HandleTypeDef *prev_out = out_uart;
+  out_uart = last_cmd_uart;
+  printf("%s G pos x=%d y=%d cm (home dist %d cm) yaw=%d deg\r\n", result,
+         (int)pos_x, (int)pos_y, (int)sqrtf(pos_x * pos_x + pos_y * pos_y), (int)yaw_deg);
+  out_uart = prev_out;
+}
+
+/* 집에 도착한 뒤 마지막 단계: 출발할 때 바라보던 방향(yaw 0°)으로 돌아서기
+ * → 급수대 앞에서 항상 같은 방향을 보고 서 있게 됨 (카메라 도킹·물 보충 정렬에 필요) */
+static void home_face_start(const char *result)
+{
+  home_result = result;
+  float angle = 0.0f - yaw_deg;
+  while (angle >  180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+
+  if (angle > 3.0f || angle < -3.0f) {
+    UART_HandleTypeDef *prev_out = out_uart;
+    out_uart = last_cmd_uart;
+    printf("G face home direction: turn %d deg\r\n", (int)angle);
+    turn_start((int)(angle > 0 ? angle + 0.5f : angle - 0.5f));
+    out_uart = prev_out;
+    homing = 3;
+  } else {
+    home_finish(result);
+  }
+}
+
+/* 한 구간 시작: 지금 위치에서 집 방향을 계산해 그쪽으로 회전
+ * - 집 방향 = atan2(-y, -x)  (지금 위치에서 원점을 가리키는 방향)
+ * - 돌 각도 = 집 방향 - 지금 yaw 를 -180~180으로 맞춤 → 더 짧은 쪽으로 돎
+ * 직진이 끝나면 다시 이 함수를 불러서 남은 오차를 한 번 더 조준 (최대 HOME_MAX_TRIES번) */
+static void home_leg(void)
+{
+  float dist = sqrtf(pos_x * pos_x + pos_y * pos_y);
+  if (dist < HOME_TOL_CM)          { home_face_start("DONE");               return; }
+  if (home_tries >= HOME_MAX_TRIES) { home_face_start("DONE (best effort)"); return; }
+  if (!imu_ok)                     { home_finish("ERR IMU not ready");  return; }
+  home_tries++;
+
+  float target = atan2f(-pos_y, -pos_x) * RAD2DEG;
+  float angle  = target - yaw_deg;
+  while (angle >  180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+
+  UART_HandleTypeDef *prev_out = out_uart;   /* 명령 처리 중에 불릴 수도 있어서 원래 출력 대상을 기억 */
+  out_uart = last_cmd_uart;
+  printf("G leg %d: turn %d deg, then %d cm\r\n", home_tries, (int)angle, (int)(dist + 0.5f));
+  if (angle > 3.0f || angle < -3.0f) {
+    turn_start((int)(angle > 0 ? angle + 0.5f : angle - 0.5f));   /* 반올림 */
+  } else {
+    turn_result = 1;               /* 이미 거의 집 쪽을 보고 있으면 회전 생략 */
+  }
+  out_uart = prev_out;
+  homing = 1;
+}
+
+/* 메인 루프에서 계속 호출: 회전이 끝나면 직진 시작, 직진이 끝나면 다음 구간 */
+static void homing_update(void)
+{
+  if (!homing) return;
+
+  if (homing == 1 && !turning) {
+    if (turn_result == 2) { home_finish("ERR (turn failed)"); return; }
+    float dist = sqrtf(pos_x * pos_x + pos_y * pos_y);   /* 회전 중 위치는 거의 안 변하지만 다시 계산 */
+    int cm = (int)(dist + 0.5f);
+    if (cm > DRIVE_MAX_CM) cm = DRIVE_MAX_CM;
+    out_uart = last_cmd_uart;
+    drive_start_cmd(cm);
+    out_uart = &huart2;
+    homing = 2;
+  }
+  else if (homing == 2 && !driving) {
+    if (drive_result == 2) { home_finish("ERR (drive failed)"); return; }
+    home_leg();                    /* 남은 오차가 있으면 다시 조준해서 한 번 더 */
+  }
+  else if (homing == 3 && !turning) {
+    home_finish(turn_result == 2 ? "ERR (final turn failed)" : home_result);
+  }
+}
+
 /* ---------------- 명령 인터페이스 ---------------- */
 
 /* 사용법 출력 */
@@ -537,8 +805,11 @@ static void print_help(void)
   printf("  F n : forward      B n : backward\r\n");
   printf("  L n : turn left    R n : turn right\r\n");
   printf("  S   : stop         ?   : status\r\n");
-  printf("  Z   : yaw = 0      I   : I2C scan + IMU re-init\r\n");
+  printf("  O   : set home here (x=y=0, yaw=0)   (Z = same as O)\r\n");
+  printf("  I   : I2C scan + IMU re-init (also sets home)\r\n");
+  printf("  G   : go home (turn to home, drive straight, repeat up to %d times)\r\n", HOME_MAX_TRIES);
   printf("  T n : turn n deg in place (+ left, - right, e.g. T 90, T -90)\r\n");
+  printf("  D n : drive n cm straight (+ forward, - backward, e.g. D 50, D -30)\r\n");
   printf("  ATMODE : HC-05 AT setting mode (PC terminal only)\r\n> ");
 }
 
@@ -557,6 +828,11 @@ static void print_status(void)
          rate10 < 0 ? "-" : "", abs(rate10) / 10, abs(rate10) % 10,
          (unsigned long)imu_err_count, (unsigned long)imu_recover_count,
          (unsigned long)(HAL_GetTick() - imu_last_ok));
+  /* 집까지 거리와 집이 있는 방향 (G 명령이 쓸 값) */
+  float home_dist = sqrtf(pos_x * pos_x + pos_y * pos_y);
+  float home_dir  = atan2f(-pos_y, -pos_x) * RAD2DEG;
+  printf("pos x=%d y=%d cm | home %d cm, direction %d deg\r\n",
+         (int)pos_x, (int)pos_y, (int)home_dist, (int)home_dir);
 }
 
 /* 대소문자 무시하고 두 문자열이 같은지 */
@@ -590,7 +866,7 @@ static void process_command(char *line)
   char cmd = (char)toupper((unsigned char)line[0]);
 
   /* 회전 중에 다른 명령(상태 조회 ? 제외)이 오면 회전 취소 → 그 명령이 우선 */
-  if (cmd != '?') turning = 0;
+  if (cmd != '?') { turning = 0; driving = 0; homing = 0; }
 
   /* T: 각도는 음수(오른쪽)도 있고 범위도 속도와 달라서 따로 처리 */
   if (cmd == 'T') {
@@ -603,6 +879,20 @@ static void process_command(char *line)
     int ang = atoi(p);
     if (ang > 360 || ang < -360) { printf("ERR T range -360~360\r\n"); return; }
     turn_start(ang);
+    return;
+  }
+
+  /* D: 거리(cm), 음수는 후진 */
+  if (cmd == 'D') {
+    char *p = line + 1;
+    while (*p == ' ') p++;
+    if (!(isdigit((unsigned char)*p) || ((*p == '-' || *p == '+') && isdigit((unsigned char)p[1])))) {
+      printf("ERR D needs cm (e.g. D 50, D -30)\r\n");
+      return;
+    }
+    int cm = atoi(p);
+    if (cm > DRIVE_MAX_CM || cm < -DRIVE_MAX_CM) { printf("ERR D range -%d~%d\r\n", DRIVE_MAX_CM, DRIVE_MAX_CM); return; }
+    drive_start_cmd(cm);
     return;
   }
 
@@ -624,9 +914,12 @@ static void process_command(char *line)
     case 'S': set_speed( 0,  0); printf("OK S\r\n");        break;
     case '?': print_status();                                  break;
     case 'H': print_help();                                    return;
-    case 'Z': yaw_deg = 0.0f; printf("OK Z (yaw=0)\r\n");     break;
+    case 'G': home_tries = 0; printf("OK G (going home)\r\n"); home_leg(); break;
+    case 'O':
+    case 'Z': odom_reset(); printf("OK O (home set here)\r\n"); break;
     case 'I': imu_err_count = 0; imu_recover_count = 0;
-              i2c_scan(); imu_init();                          break;
+              i2c_scan(); imu_init(); odom_reset();
+              printf("home set here\r\n");                  break;
     default:  printf("ERR unknown '%c' (H: help)\r\n", line[0]); break;
   }
 }
@@ -821,6 +1114,7 @@ int main(void)
   /* 3-1) I2C 센서 확인 + MPU6050 영점 잡기 (약 1초, 이때 차를 건드리지 않기) */
   i2c_scan();
   imu_init();
+  odom_reset();     /* 켠 자리 = 집(출발점) */
 
   /* 4) 10ms 제어 타이머 시작 → 이때부터 HAL_TIM_PeriodElapsedCallback이 10ms마다 불림 */
   HAL_TIM_Base_Start_IT(&htim6);
@@ -850,6 +1144,9 @@ int main(void)
       uart_poll_commands();    /* 평소: 명령 처리 */
       imu_update();            /* 자이로 읽어서 각도 누적 */
       turn_update();           /* T 명령 회전 중이면 속도 조절·도착 판단 */
+      drive_update();          /* D 명령 이동 중이면 속도·방향 조절, 도착 판단 */
+      odom_update();           /* 엔코더 + 자이로로 현재 위치 (x, y) 갱신 */
+      homing_update();         /* G 귀소 중이면 다음 단계로 진행 */
       check_cmd_timeout();
     }
   }
