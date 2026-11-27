@@ -78,7 +78,7 @@
 #define CMD_DEFAULT_SPEED  20
 #define CMD_MAX_SPEED      40
 #define CMD_LINE_MAX       32     /* 명령 한 줄 최대 글자 수 */
-#define RX_RING_SIZE       64     /* 수신 링버퍼 크기 (2의 거듭제곱) */
+#define RX_RING_SIZE       256    /* 수신 링버퍼 크기 (2의 거듭제곱). Pi 패킷이 한꺼번에 와도 안 넘치게 64 → 256 */
 
 /* 안전장치: 마지막 명령 후 이 시간(ms) 동안 새 명령이 없으면 자동 정지
  * 지금은 손으로 명령 보내는 테스트라 2초, 라즈베리파이가 계속 보내게 되면 500 정도로 줄이기 */
@@ -142,6 +142,19 @@
 #define HOME_TOL_CM        5.0f          /* 집까지 이만큼 가까우면 도착 */
 #define HOME_MAX_TRIES     3             /* 회전+직진을 최대 몇 번 반복해서 다시 조준할지 */
 #define RAD2DEG            57.2957795f   /* 180 / π */
+
+/* ---- Raspberry Pi 센서 패킷 수신 (docs/line_packet.md, lidar_packet.md, fire.md) ----
+ * 텍스트 명령은 ASCII(0x7F 이하)라서 0xC3으로 시작하지 않음 → 0xC3이 오면 패킷으로 보고 따로 모음 */
+#define PKT_SYNC           0xC3
+#define PKT_MAX_LEN        69            /* 가장 긴 패킷 = LiDAR v3 */
+#define PKT_LIDAR          0x3C          /* C3 3C: LiDAR 8구역 v3, 69바이트 */
+#define PKT_LINE           0x4C          /* C3 4C: 선 v2, 25바이트 */
+#define PKT_SUMMARY        0x5C          /* C3 5C: LiDAR 주행 요약 v1, 21바이트 */
+#define PKT_FIRE           0x6C          /* C3 6C: 불 v1, 22바이트 */
+#define PI_LINK_TIMEOUT_MS 500           /* 이 시간 동안 정상 패킷이 하나도 없으면 "Pi 연결 끊김" */
+#define NO_I16             0x7FFF        /* 값 없음 (int16 필드) */
+#define NO_U16             0xFFFF        /* 값 없음 (uint16 필드) */
+#define CLEAR_U16          0xFFFE        /* 주행 요약: 봤지만 장애물 없음 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -177,6 +190,9 @@ typedef struct {
   uint16_t tail;                           /* 메인 루프가 읽는 위치 */
   char line[CMD_LINE_MAX];                 /* 조립 중인 명령 한 줄 */
   uint8_t len;
+  uint8_t pkt[PKT_MAX_LEN];                /* 조립 중인 Pi 패킷 (바이너리) */
+  uint8_t pkt_len;                         /* 지금까지 모은 바이트 수 (0이면 패킷 아님) */
+  uint8_t pkt_need;                        /* 이 패킷의 전체 길이 */
 } cmd_port_t;
 
 static cmd_port_t port_pc = { .huart = &huart2, .interactive = 1 };
@@ -233,6 +249,60 @@ static const char *home_result = "DONE";   /* 마지막 정렬 회전 뒤에 보
 
 /* AT 중계 모드: 1이면 PC 터미널 ↔ HC-05를 그대로 이어줌 (HC-05 설정 확인·변경용) */
 static uint8_t at_bridge = 0;
+
+/* Pi에서 받은 최신 패킷 값 (모두 리틀엔디언으로 풀어서 저장)
+ * rx_tick: 이 패킷을 받은 시각. 0이면 아직 한 번도 못 받음 */
+typedef struct {
+  uint32_t rx_tick;
+  uint8_t  status;          /* 0 선 있음, 1 선 없음, 2 영상 없음, 3 처리 오류 */
+  uint16_t seq;
+  int16_t  offset, angle;   /* -1000 왼쪽 ~ +1000 오른쪽 / 0.01도. 없으면 0x7FFF */
+  int16_t  s_offset, s_angle, rate;  /* 부드럽게 만든 값, 변화 속도 */
+  uint8_t  conf, cand;
+  int8_t   last_side;       /* -1 왼쪽, 0 가운데, +1 오른쪽 */
+  uint16_t lost, age;       /* ms, 없으면 0xFFFF */
+} pi_line_t;
+
+typedef struct {
+  uint32_t rx_tick;
+  uint8_t  status;          /* 0 complete, 1 partial, 2 startup */
+  uint16_t seq;
+  uint16_t front, left, right, nearest;  /* mm. 0xFFFE 장애물 없음, 0xFFFF 못 봄 */
+  int16_t  bearing;         /* 0.1도, + 오른쪽. 없으면 0x7FFF */
+  uint8_t  flags;           /* bit0 통로 안 너무 가까움, bit1 앞쪽 반사 없음 */
+  uint16_t age;
+} pi_summary_t;
+
+typedef struct {
+  uint32_t rx_tick;
+  uint8_t  status;          /* 0 FIRE, 1 NO_FIRE, 2 SUSPECT, 3 NO_FRAME, 4 ERROR, 5 NO_MODEL */
+  uint16_t seq;
+  int16_t  x;               /* -1000 왼쪽 ~ +1000 오른쪽. 없으면 0x7FFF */
+  uint16_t y, size;         /* 0~1000. 없으면 0xFFFF */
+  uint8_t  conf, hits, window, cand;
+  uint16_t seen, age;
+} pi_fire_t;
+
+typedef struct {
+  uint32_t rx_tick;
+  uint8_t  status;          /* 0 complete, 1 partial, 2 startup */
+  uint16_t seq;
+  uint8_t  mask;            /* bit i: i번 구역을 이번 회전에 봤는지 */
+  uint8_t  z_status[8];     /* 0 VALID, 1 TOO_CLOSE, 2 TOO_FAR, 3 NO_RETURN, 4 SENSOR_INVALID, 5 NO_DATA */
+  uint16_t z_dist[8];       /* mm */
+  uint16_t z_age[8];        /* ms */
+} pi_lidar_t;
+
+static pi_line_t    pi_line;
+static pi_summary_t pi_sum;
+static pi_fire_t    pi_fire;
+static pi_lidar_t   pi_lidar;
+
+/* 통신 품질 확인용 카운터 */
+static uint32_t pi_ok_line = 0, pi_ok_sum = 0, pi_ok_fire = 0, pi_ok_lidar = 0;
+static uint32_t pi_err_crc = 0;      /* CRC가 틀림 (전송 중 깨짐) */
+static uint32_t pi_err_format = 0;   /* 모르는 헤더나 버전 */
+static uint32_t pi_last_rx = 0;      /* 마지막으로 정상 패킷을 받은 시각 (0이면 한 번도 없음) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -260,6 +330,9 @@ static void odom_update(void);
 static void home_leg(void);
 static void homing_update(void);
 static void home_face_start(const char *result);
+static void pkt_feed(cmd_port_t *p, uint8_t b);
+static int  pi_link_ok(void);
+static void print_packets(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -810,6 +883,7 @@ static void print_help(void)
   printf("  G   : go home (turn to home, drive straight, repeat up to %d times)\r\n", HOME_MAX_TRIES);
   printf("  T n : turn n deg in place (+ left, - right, e.g. T 90, T -90)\r\n");
   printf("  D n : drive n cm straight (+ forward, - backward, e.g. D 50, D -30)\r\n");
+  printf("  P   : show latest Raspberry Pi packets (line / lidar / fire)\r\n");
   printf("  ATMODE : HC-05 AT setting mode (PC terminal only)\r\n> ");
 }
 
@@ -833,6 +907,13 @@ static void print_status(void)
   float home_dir  = atan2f(-pos_y, -pos_x) * RAD2DEG;
   printf("pos x=%d y=%d cm | home %d cm, direction %d deg\r\n",
          (int)pos_x, (int)pos_y, (int)home_dist, (int)home_dir);
+  /* Raspberry Pi 패킷 수신 상태 */
+  if (pi_last_rx == 0) printf("pi NONE (no packet yet)");
+  else printf("pi %s (last %lums ago)", pi_link_ok() ? "OK" : "LOST",
+              (unsigned long)(HAL_GetTick() - pi_last_rx));
+  printf(" | ok line=%lu sum=%lu fire=%lu lidar=%lu | err crc=%lu format=%lu\r\n",
+         (unsigned long)pi_ok_line, (unsigned long)pi_ok_sum, (unsigned long)pi_ok_fire,
+         (unsigned long)pi_ok_lidar, (unsigned long)pi_err_crc, (unsigned long)pi_err_format);
 }
 
 /* 대소문자 무시하고 두 문자열이 같은지 */
@@ -866,7 +947,7 @@ static void process_command(char *line)
   char cmd = (char)toupper((unsigned char)line[0]);
 
   /* 회전 중에 다른 명령(상태 조회 ? 제외)이 오면 회전 취소 → 그 명령이 우선 */
-  if (cmd != '?') { turning = 0; driving = 0; homing = 0; }
+  if (cmd != '?' && cmd != 'P') { turning = 0; driving = 0; homing = 0; }
 
   /* T: 각도는 음수(오른쪽)도 있고 범위도 속도와 달라서 따로 처리 */
   if (cmd == 'T') {
@@ -913,6 +994,7 @@ static void process_command(char *line)
     case 'R': set_speed( v, -v); printf("OK R %d\r\n", v); break;   /* 왼쪽 앞으로, 오른쪽 뒤로 */
     case 'S': set_speed( 0,  0); printf("OK S\r\n");        break;
     case '?': print_status();                                  break;
+    case 'P': print_packets();                                 break;
     case 'H': print_help();                                    return;
     case 'G': home_tries = 0; printf("OK G (going home)\r\n"); home_leg(); break;
     case 'O':
@@ -924,14 +1006,235 @@ static void process_command(char *line)
   }
 }
 
+/* ---------------- Raspberry Pi 센서 패킷 수신 ----------------
+ * 패킷 = [C3][종류][버전]...[CRC 하위][CRC 상위], 리틀엔디언 (Pi의 struct.pack("<...")와 같음) */
+
+/* CRC-16/CCITT-FALSE: Pi의 crc16_ccitt_false()와 같은 계산 */
+static uint16_t crc16_ccitt_false(const uint8_t *d, uint16_t n)
+{
+  uint16_t crc = 0xFFFF;
+  while (n--) {
+    crc ^= (uint16_t)(*d++) << 8;
+    for (int i = 0; i < 8; i++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+/* 리틀엔디언 2바이트 읽기: b[0]이 하위 바이트 */
+static uint16_t rd_u16(const uint8_t *b) { return (uint16_t)(b[0] | (b[1] << 8)); }
+static int16_t  rd_i16(const uint8_t *b) { return (int16_t)rd_u16(b); }
+
+/* 두 번째 바이트(종류)로 전체 길이를 앎. 모르는 종류면 0 */
+static uint8_t pkt_length(uint8_t type)
+{
+  switch (type) {
+    case PKT_LIDAR:   return 69;
+    case PKT_LINE:    return 25;
+    case PKT_SUMMARY: return 21;
+    case PKT_FIRE:    return 22;
+    default:          return 0;
+  }
+}
+
+/* 완성된 패킷 하나 검사 → 맞으면 구조체에 풀어 넣기 */
+static void pkt_handle(const uint8_t *b, uint8_t n)
+{
+  /* 1) CRC: 마지막 2바이트를 뺀 전체로 계산한 값과 같아야 함 */
+  if (crc16_ccitt_false(b, n - 2) != rd_u16(b + n - 2)) { pi_err_crc++; return; }
+
+  uint32_t now = HAL_GetTick();
+  switch (b[1]) {
+    case PKT_LINE:
+      if (b[2] != 2) { pi_err_format++; return; }
+      pi_line.status    = b[3];
+      pi_line.seq       = rd_u16(b + 4);
+      pi_line.offset    = rd_i16(b + 6);
+      pi_line.angle     = rd_i16(b + 8);
+      pi_line.s_offset  = rd_i16(b + 10);
+      pi_line.s_angle   = rd_i16(b + 12);
+      pi_line.rate      = rd_i16(b + 14);
+      pi_line.conf      = b[16];
+      pi_line.cand      = b[17];
+      pi_line.last_side = (int8_t)b[18];
+      pi_line.lost      = rd_u16(b + 19);
+      pi_line.age       = rd_u16(b + 21);
+      pi_line.rx_tick   = now;
+      pi_ok_line++;
+      break;
+
+    case PKT_SUMMARY:
+      if (b[2] != 1) { pi_err_format++; return; }
+      pi_sum.status  = b[3];
+      pi_sum.seq     = rd_u16(b + 4);
+      pi_sum.front   = rd_u16(b + 6);
+      pi_sum.left    = rd_u16(b + 8);
+      pi_sum.right   = rd_u16(b + 10);
+      pi_sum.nearest = rd_u16(b + 12);
+      pi_sum.bearing = rd_i16(b + 14);
+      pi_sum.flags   = b[16];
+      pi_sum.age     = rd_u16(b + 17);
+      pi_sum.rx_tick = now;
+      pi_ok_sum++;
+      break;
+
+    case PKT_FIRE:
+      if (b[2] != 1) { pi_err_format++; return; }
+      pi_fire.status  = b[3];
+      pi_fire.seq     = rd_u16(b + 4);
+      pi_fire.x       = rd_i16(b + 6);
+      pi_fire.y       = rd_u16(b + 8);
+      pi_fire.size    = rd_u16(b + 10);
+      pi_fire.conf    = b[12];
+      pi_fire.hits    = b[13];
+      pi_fire.window  = b[14];
+      pi_fire.cand    = b[15];
+      pi_fire.seen    = rd_u16(b + 16);
+      pi_fire.age     = rd_u16(b + 18);
+      pi_fire.rx_tick = now;
+      pi_ok_fire++;
+      break;
+
+    case PKT_LIDAR:
+      if (b[2] != 3) { pi_err_format++; return; }
+      pi_lidar.status = b[3];
+      pi_lidar.seq    = rd_u16(b + 4);
+      pi_lidar.mask   = b[18];
+      for (int i = 0; i < 8; i++) {           /* 구역 i 레코드 = 19 + 6*i 부터 6바이트 */
+        const uint8_t *z = b + 19 + 6 * i;
+        pi_lidar.z_status[i] = z[0];
+        pi_lidar.z_dist[i]   = rd_u16(z + 1);
+        pi_lidar.z_age[i]    = rd_u16(z + 4);   /* z[3]은 품질 바이트 (아직 안 씀) */
+      }
+      pi_lidar.rx_tick = now;
+      pi_ok_lidar++;
+      break;
+
+    default:
+      pi_err_format++;
+      return;
+  }
+  pi_last_rx = now;
+}
+
+/* 1바이트씩 받아 패킷 조립. port_poll이 "0xC3이 왔거나 조립 중"일 때만 부름 */
+static void pkt_feed(cmd_port_t *p, uint8_t b)
+{
+  if (p->pkt_len == 0) {                  /* 첫 바이트 = 0xC3 */
+    p->pkt[0] = b;
+    p->pkt_len = 1;
+    return;
+  }
+  if (p->pkt_len == 1) {                  /* 두 번째 바이트 = 종류 → 길이 결정 */
+    uint8_t need = pkt_length(b);
+    if (need == 0) {                      /* 모르는 종류: 버리고 처음부터 */
+      pi_err_format++;
+      p->pkt_len = 0;
+      if (b == PKT_SYNC) { p->pkt[0] = b; p->pkt_len = 1; }   /* C3 C3 ... 이면 두 번째 C3부터 다시 */
+      return;
+    }
+    p->pkt[1] = b;
+    p->pkt_need = need;
+    p->pkt_len = 2;
+    return;
+  }
+  p->pkt[p->pkt_len++] = b;               /* 나머지는 길이만큼 그냥 모음 (안에 0x0D, 0xC3이 있어도 데이터) */
+  if (p->pkt_len >= p->pkt_need) {
+    pkt_handle(p->pkt, p->pkt_need);
+    p->pkt_len = 0;
+  }
+}
+
+/* Pi 연결이 살아 있나: 최근 PI_LINK_TIMEOUT_MS 안에 정상 패킷이 있었나 */
+static int pi_link_ok(void)
+{
+  return pi_last_rx != 0 && (HAL_GetTick() - pi_last_rx) < PI_LINK_TIMEOUT_MS;
+}
+
+/* "값 없음" 표시를 --로 바꿔서 출력 */
+static void print_i16(const char *name, int16_t v)
+{
+  if (v == (int16_t)NO_I16) printf(" %s=--", name);
+  else printf(" %s=%d", name, v);
+}
+static void print_u16(const char *name, uint16_t v)
+{
+  if (v == NO_U16) printf(" %s=--", name);
+  else if (v == CLEAR_U16) printf(" %s=clear", name);
+  else printf(" %s=%u", name, v);
+}
+
+/* 받은 시각이 0이면 "none", 아니면 몇 ms 전에 받았는지 */
+static int print_rx_head(const char *name, uint32_t rx_tick, uint16_t seq, uint8_t status)
+{
+  if (rx_tick == 0) { printf("%-6s none\r\n", name); return 0; }
+  printf("%-6s #%u st=%u rx %lums ago |", name, seq, status,
+         (unsigned long)(HAL_GetTick() - rx_tick));
+  return 1;
+}
+
+/* P 명령: 최신 패킷 값 전부 */
+static void print_packets(void)
+{
+  static const char *fire_name[] = { "FIRE", "NO_FIRE", "SUSPECT", "NO_FRAME", "ERROR", "NO_MODEL" };
+  static const char *zone_name[] = { "F", "FR", "R", "BR", "B", "BL", "L", "FL" };
+
+  if (print_rx_head("line", pi_line.rx_tick, pi_line.seq, pi_line.status)) {
+    print_i16("off", pi_line.offset);
+    print_i16("s_off", pi_line.s_offset);
+    print_i16("rate", pi_line.rate);
+    print_i16("ang", pi_line.angle);       /* 0.01도 */
+    printf(" conf=%u cand=%u side=%d", pi_line.conf, pi_line.cand, pi_line.last_side);
+    print_u16("lost", pi_line.lost);
+    print_u16("age", pi_line.age);
+    printf("\r\n");
+  }
+  if (print_rx_head("sum", pi_sum.rx_tick, pi_sum.seq, pi_sum.status)) {
+    print_u16("front", pi_sum.front);
+    print_u16("left", pi_sum.left);
+    print_u16("right", pi_sum.right);
+    print_u16("near", pi_sum.nearest);
+    print_i16("dir", pi_sum.bearing);      /* 0.1도 */
+    printf(" flags=0x%02X", pi_sum.flags);
+    print_u16("age", pi_sum.age);
+    printf("\r\n");
+  }
+  if (print_rx_head("fire", pi_fire.rx_tick, pi_fire.seq, pi_fire.status)) {
+    printf(" %s", pi_fire.status < 6 ? fire_name[pi_fire.status] : "?");
+    print_i16("x", pi_fire.x);
+    print_u16("y", pi_fire.y);
+    print_u16("size", pi_fire.size);
+    printf(" conf=%u hits=%u/%u", pi_fire.conf, pi_fire.hits, pi_fire.window);
+    print_u16("seen", pi_fire.seen);
+    print_u16("age", pi_fire.age);
+    printf("\r\n");
+  }
+  if (print_rx_head("lidar", pi_lidar.rx_tick, pi_lidar.seq, pi_lidar.status)) {
+    for (int i = 0; i < 8; i++) {
+      if (pi_lidar.z_status[i] == 0 || pi_lidar.z_status[i] == 1)   /* VALID, TOO_CLOSE는 거리 표시 */
+        printf(" %s=%u%s", zone_name[i], pi_lidar.z_dist[i], pi_lidar.z_status[i] == 1 ? "!" : "");
+      else
+        printf(" %s=s%u", zone_name[i], pi_lidar.z_status[i]);
+    }
+    printf("\r\n");
+  }
+}
+
 /* 한 통로의 링버퍼에서 글자를 꺼내 한 줄로 모으고, Enter가 오면 실행
  * 답장은 그 명령이 들어온 통로로 보냄 */
 static void port_poll(cmd_port_t *p)
 {
   out_uart = p->huart;
   while (p->tail != p->head) {
-    char c = (char)p->ring[p->tail & (RX_RING_SIZE - 1)];
+    uint8_t b = p->ring[p->tail & (RX_RING_SIZE - 1)];
     p->tail++;
+
+    /* Pi 패킷: 0xC3으로 시작하거나 이미 조립 중이면 바이너리로 처리 (에코·명령 해석 안 함) */
+    if (p->pkt_len > 0 || b == PKT_SYNC) {
+      pkt_feed(p, b);
+      continue;
+    }
+    char c = (char)b;
 
     if (c == '\r' || c == '\n') {            /* Enter: 한 줄 완성 (CR+LF면 두 번째는 빈 줄이라 무시됨) */
       if (p->len > 0) {
