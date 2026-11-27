@@ -1,0 +1,23 @@
+# 전원을 켜면 main.py(카메라·선·LiDAR·스트리밍)를 자동으로 시작한다.
+# 설치: docs/setup.md "전원 켜면 자동 실행" 참고
+[Unit]
+Description=Fire RC car Raspberry Pi processes (camera, line, lidar, stream)
+# 네트워크를 기다리지 않는다. 선·LiDAR는 Wi-Fi 없이도 돌아야 하고, 스트리밍은 스스로 다시 연결한다.
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=song
+SupplementaryGroups=dialout video
+WorkingDirectory=/home/song/proj
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/home/song/proj/.venv/bin/python /home/song/proj/main.py
+# main.py가 "계속 죽는 프로세스"로 종료(코드 1)해도 5초 뒤 전체를 다시 시작한다.
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

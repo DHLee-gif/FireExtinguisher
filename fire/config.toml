@@ -1,0 +1,29 @@
+# 학습한 YOLO 모델 (ONNX). 없으면 "모델 없음"을 보내며 5초마다 다시 찾는다. 만드는 법: docs/fire.md
+model_path = "models/fire.onnx"   # fire/ 폴더 기준
+
+# 모델 입력 크기 (학습·export할 때 imgsz와 같아야 한다)
+input_size = 320
+
+# 모델의 클래스 중 "불" 번호. 지금 모델(rabahdev/fire-smoke-yolov8n)은 0=연기, 1=불.
+# 직접 학습한 불 전용 모델(colab_train.ipynb)로 바꾸면 0.
+fire_class = 1
+
+# 이 점수(0~1)를 넘어야 불 후보로 본다. 오탐(전등·주황색 물체)이 많으면 올린다.
+# D-Fire 시험 600장: 0.5 → 감지 67%/오탐 0%, 0.25 → 88%/0%, 0.15 → 92%/1% (docs/fire.md)
+score_threshold = 0.25
+nms_threshold = 0.45
+
+# 연속 감지: 최근 window장 중 confirm_hits장 이상에서 보이면 "불 확정".
+# 확정된 뒤에는 최근 window장에서 한 번도 안 보여야 "불 없음"으로 돌아간다.
+window = 5
+confirm_hits = 3
+
+# 초당 추론 횟수 상한. 불은 움직이지 않으니 느려도 된다 (우선순위 낮음). docs/timing.md
+# 2회면 최근 5장 중 3장 → 불 확정까지 약 1~2.5초.
+max_fps = 2
+
+# 추론에 쓸 CPU 스레드 수. 불 감지는 코어 하나(main.toml)만 쓰므로 1.
+threads = 1
+
+# 이보다 오래된 영상(초)은 쓰지 않는다
+max_frame_age_s = 0.5

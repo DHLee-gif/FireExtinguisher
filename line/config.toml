@@ -1,0 +1,47 @@
+# 따라갈 선 색: 아래 [colors.이름] 중 하나
+color = "white"
+
+# 볼 영역 (화면 비율, 0=위/왼쪽, 1=아래/오른쪽)
+roi_top = 0.5
+roi_bottom = 1.0
+
+# 선 폭 허용 범위 (화면 너비 비율). 넓은 반사나 정지선을 거른다.
+min_width = 0.01
+max_width = 0.25
+
+# 처리할 크기 배율 (1=원본). 작을수록 빠르고 가는 선에 약하다.
+scale = 0.5
+
+# 이 신뢰도(0~1) 미만이면 "선 없음"
+min_confidence = 0.5
+
+# 방금(0.5초 안) 본 선에서 치우침이 이보다 크게 튀면 다른 선으로 보고 "선 없음"
+max_jump = 0.4
+
+# 초당 처리 횟수 상한. 카메라는 30장이지만 LiDAR 한 바퀴(약 192ms)에 3번이면 충분하다. docs/timing.md
+max_fps = 15
+
+# 부드럽게 만드는 정도 (1=원값 그대로, 작을수록 부드럽지만 늦게 반응). 처리 1번마다 적용된다.
+# max_fps를 바꾸면 같이 본다: 30fps에서 0.5였던 반응 속도가 15fps에서는 0.75다.
+smoothing = 0.75
+
+# 이보다 오래된 영상(초)은 쓰지 않는다
+max_frame_age_s = 0.2
+
+# HSV 범위: H 0~179, S 0~255, V 0~255
+# contrast는 선의 왼쪽과 오른쪽 바닥(max_width만큼 떨어진 곳)을 모두 비교한다
+# contrast > 0: 양쪽보다 그만큼 밝아야 함, < 0: 어두워야 함, 0: 사용 안 함
+[colors.white]
+hsv_low = [0, 0, 110]
+hsv_high = [179, 70, 255]
+contrast = 20
+
+[colors.black]
+hsv_low = [0, 0, 0]
+hsv_high = [179, 255, 110]
+contrast = -20
+
+[colors.yellow]
+hsv_low = [18, 80, 80]
+hsv_high = [38, 255, 255]
+contrast = 0
