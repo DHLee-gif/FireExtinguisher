@@ -1,9 +1,11 @@
-"""Start camera, line, lidar, fire, and stream as separate processes; restart any that dies.
+"""Start camera, line, lidar, fire, stream, and stm32 as separate processes; restart any that dies.
 If a driving process (camera, line, lidar) exits 5 times within 60 s, stop all of them and
 exit with code 1 so systemd restarts everything. An optional process (stream) never stops
 the others: it is only restarted more slowly. Fire and stream are optional.
 
-usage: main.py [--lidar-replay FILE.hex] [--no-stream] [--no-fire]
+stm32 forwards the packets to the STM32 board and waits by itself while the board is unplugged.
+
+usage: main.py [--lidar-replay FILE.hex] [--no-stream] [--no-fire] [--no-stm32]
 """
 
 import argparse
@@ -39,15 +41,17 @@ def load_cores(path=CORES_PATH, names=None) -> dict:
     return result
 
 
-def build_commands(lidar_replay=None, stream=True, fire=True):
+def build_commands(lidar_replay=None, stream=True, fire=True, stm32=True):
     commands = {"camera": ["camera/capture.py"], "line": ["line/run.py"], "lidar": ["lidar/run.py"],
-                "fire": ["fire/run.py"], "stream": ["stream/run.py"]}
+                "fire": ["fire/run.py"], "stream": ["stream/run.py"], "stm32": ["stm32/run.py"]}
     if lidar_replay:
         commands["lidar"] += ["--replay", str(Path(lidar_replay).resolve())]
     if not stream:
         del commands["stream"]
     if not fire:
         del commands["fire"]
+    if not stm32:
+        del commands["stm32"]  # e.g. to run stm32/run.py --show 1 by hand in another terminal
     return {name: [sys.executable, str(ROOT / c[0]), *c[1:]] for name, c in commands.items()}
 
 
@@ -109,6 +113,7 @@ def main() -> int:
     parser.add_argument("--lidar-replay", type=Path)
     parser.add_argument("--no-stream", action="store_true", help="do not start Wi-Fi streaming")
     parser.add_argument("--no-fire", action="store_true", help="do not start fire detection")
+    parser.add_argument("--no-stm32", action="store_true", help="do not send packets to the STM32")
     args = parser.parse_args()
     stopping = False
 
@@ -118,7 +123,8 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    commands = build_commands(args.lidar_replay, stream=not args.no_stream, fire=not args.no_fire)
+    commands = build_commands(args.lidar_replay, stream=not args.no_stream, fire=not args.no_fire,
+                              stm32=not args.no_stm32)
     cores = load_cores(names=build_commands().keys())
     return supervise(commands, lambda: stopping, cores=cores)
 

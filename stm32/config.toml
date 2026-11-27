@@ -1,0 +1,15 @@
+# STM32 link (stm32/run.py). 규격: docs/stm32_link.md
+
+# "auto": Nucleo(ST-LINK) USB를 자동으로 찾음 (/dev/serial/by-id/...STLink... → 없으면 /dev/ttyACM*)
+port = "auto"
+baud = 115200
+
+# Pi 안에서 이보다 오래 기다린 패킷은 보내지 않는다 (ms). 그만큼 오래된 값으로 주행하면 위험하다.
+max_delay_ms = 300
+
+# 보낼 패킷: 공유 값 이름 = [그 값 안의 패킷 필드]
+# lidar.packet(69바이트, 8구역)은 STM32에서 P로 방향별 거리를 볼 때 쓴다. 주행 판단은 summary_packet.
+[sources]
+line = ["packet"]
+lidar = ["summary_packet", "packet"]
+fire = ["packet"]

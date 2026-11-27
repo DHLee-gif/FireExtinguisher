@@ -7,3 +7,4 @@ lidar = [0]
 line = [1]
 fire = [2]
 stream = [2]
+stm32 = [0]    # 패킷 전달만 해서 가볍다 (camera, lidar와 같은 코어)

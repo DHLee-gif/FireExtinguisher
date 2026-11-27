@@ -37,6 +37,8 @@ class SuperviseTest(unittest.TestCase):
         self.assertNotIn("stream", build_commands(stream=False))
         self.assertIn("fire", build_commands())
         self.assertNotIn("fire", build_commands(fire=False))
+        self.assertIn("stm32", build_commands())
+        self.assertNotIn("stm32", build_commands(stm32=False))
 
     def test_process_runs_only_on_its_cores(self):
         core = min(os.sched_getaffinity(0))

@@ -15,6 +15,7 @@ Raspberry Pi 4가 LiDAR 거리, 선 위치, 불 위치를 만들어 STM32에 넘
 | [fire.md](fire.md) | 불 감지: 사진 수집 → 라벨링 → PC 학습 → Pi에 넣기, 불 패킷 v1 규격 |
 | [lidar_packet.md](lidar_packet.md) | LiDAR 처리와 STM32 패킷 v3(69바이트)·주행 요약(21바이트) 규격 |
 | [line_packet.md](line_packet.md) | 선 패킷 v2(25바이트) 규격 |
+| [stm32_link.md](stm32_link.md) | Pi → STM32 USB 전송 규칙과 시험 방법 |
 
 ## 구조
 
@@ -27,7 +28,7 @@ Raspberry Pi 4가 LiDAR 거리, 선 위치, 불 위치를 만들어 STM32에 넘
   ├ lidar/   LiDAR UART → 해석 → lidar.json (패킷 v3 + 주행 요약 포함)
   ├ fire/    공유 영상 → YOLO(ONNX) → fire.json (불 패킷 v1 포함, 2Hz)
   ├ stream/  공유 영상 → JPEG → WebSocket → 웹앱 서버 (10fps)
-  └ stm32/   (아직 없음) line.json·lidar.json의 패킷을 STM32 UART로 전송
+  └ stm32/   line.json·lidar.json·fire.json의 새 패킷을 USB로 STM32에 전송 (run.py)
 ```
 
 프로세스끼리는 `/dev/shm/firecar/`(RAM) 파일로만 주고받는다. 쓰는 쪽은 파일을 통째로 바꿔치기(atomic replace)하고
@@ -40,7 +41,7 @@ Raspberry Pi 4가 LiDAR 거리, 선 위치, 불 위치를 만들어 STM32에 넘
 | `lidar/` | `run.py`: LiDAR 수신·해석 → 패킷 | 실제 센서로 동작 |
 | `stream/` | 카메라 화면 → 웹앱 (Wi-Fi) | 가상 웹앱으로 동작 |
 | `fire/` | 불 감지 (YOLO, Pi는 추론만) | 동작 (공개 학습 모델, 시험 사진 감지 88%·오탐 0%) |
-| `stm32/` | STM32로 패킷 전송 | 시작 안 함 (나중에) |
+| `stm32/` | `run.py`: 패킷을 USB로 STM32에 전송 ([stm32_link.md](stm32_link.md)). `firecar/`, `sensor/`는 STM32 펌웨어 | 동작 (PC·가상 포트로 확인) |
 | `common/` | 영역끼리 공유하는 규격만 (`framebus.py` 영상, `valuebus.py` 값) | 동작 |
 | `tools/check.py` | 규칙 검사 + 전체 테스트 | |
 | `deploy/` | systemd 서비스 파일 | |
@@ -57,7 +58,7 @@ Raspberry Pi 4가 LiDAR 거리, 선 위치, 불 위치를 만들어 STM32에 넘
   둘 다 계속 죽어도 다른 프로세스를 멈추지 않는다.
 - **조정할 값(선 색, 임계값, 노출, 포트, 서버 주소)은 코드가 아니라 각 영역의 `config.toml`에 둔다.** 선 색 기본값은 흰색.
 - **불은 실제 불꽃(휴지·촛불·라이터).** 여러 번 연속 감지됐을 때만 인정한다.
-- **LiDAR 패킷 v3(69바이트)를 바꾸면 STM32 펌웨어도 함께 바꿔야 한다.** 펌웨어는 이 저장소에 없다.
+- **패킷 형식을 바꾸면 STM32 펌웨어(`stm32/firecar/Core/Src/main.c`)도 함께 바꿔야 한다.**
 - **예외를 조용히 삼키지 않는다** (`except:` 금지, `except Exception: pass` 금지).
 - 테스트는 실제 장치 없이 돌아야 한다. 파일 이름은 `<영역>/tests/test_*.py`.
 
